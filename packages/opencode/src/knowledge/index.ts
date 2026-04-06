@@ -68,17 +68,72 @@ export async function learnFact(input: {
 }
 
 /**
- * Fetch active knowledge for a project, optionally filtered by scope prefix.
- * Returns entries ordered by importance desc, capped at `limit`.
+ * Fetch active knowledge for a project.
+ * When `context` is provided, blends keyword-matched facts with importance-ranked
+ * facts so that facts relevant to the current user message surface even if their
+ * stored importance is low.
  */
 export async function recallFacts(input: {
   projectId: ProjectID
   scopePrefix?: string
   limit?: number
+  context?: string // optional: user message text for contextual keyword boost
 }): Promise<KnowledgeEntry[]> {
   const db = zengramDb()
   const scope = input.scopePrefix ?? "/"
   const limit = Math.min(input.limit ?? 20, 100)
+  const now = Date.now() * 1000
+
+  if (input.context) {
+    // Extract significant keywords (>= 4 chars, not stopwords) from the context.
+    const words = input.context
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 4 && !STOP_WORDS.has(w))
+    const keywords = [...new Set(words)].slice(0, 8)
+
+    if (keywords.length > 0) {
+      // Fetch importance-ranked baseline + keyword matches, deduplicate by id.
+      const baseline = await db.query<KnowledgeEntry>(
+        `SELECT id, scope, subject, content, importance, source_session
+         FROM knowledge
+         WHERE project_id = $1
+           AND scope LIKE $2
+           AND status = 'active'
+           AND (valid_to IS NULL OR valid_to > $3)
+         ORDER BY importance DESC, access_count DESC
+         LIMIT ${Math.ceil(limit * 0.6)}`,
+        [input.projectId, `${scope}%`, now],
+      )
+
+      // Build OR conditions for each keyword
+      const whereParts = keywords.map((_, i) => `(subject ILIKE $${i + 4} OR content ILIKE $${i + 4})`).join(" OR ")
+      const contextMatches = await db.query<KnowledgeEntry>(
+        `SELECT id, scope, subject, content, importance, source_session
+         FROM knowledge
+         WHERE project_id = $1
+           AND scope LIKE $2
+           AND status = 'active'
+           AND (valid_to IS NULL OR valid_to > $3)
+           AND (${whereParts})
+         ORDER BY importance DESC
+         LIMIT ${Math.ceil(limit * 0.6)}`,
+        [input.projectId, `${scope}%`, now, ...keywords.map((k) => `%${k}%`)],
+      )
+      // Merge: context matches first (higher relevance), then baseline, deduplicated.
+      const seen = new Set<string>()
+      const merged: KnowledgeEntry[] = []
+      for (const row of [...contextMatches, ...baseline]) {
+        if (!seen.has(row.id)) {
+          seen.add(row.id)
+          merged.push(row)
+        }
+        if (merged.length >= limit) break
+      }
+      return merged
+    }
+  }
 
   const rows = await db.query<KnowledgeEntry>(
     `SELECT id, scope, subject, content, importance, source_session
@@ -89,10 +144,17 @@ export async function recallFacts(input: {
        AND (valid_to IS NULL OR valid_to > $3)
      ORDER BY importance DESC, access_count DESC
      LIMIT ${limit}`,
-    [input.projectId, `${scope}%`, Date.now() * 1000],
+    [input.projectId, `${scope}%`, now],
   )
   return rows
 }
+
+const STOP_WORDS = new Set([
+  "that", "this", "with", "have", "from", "they", "will", "been", "when",
+  "your", "what", "about", "which", "there", "their", "would", "could",
+  "should", "does", "into", "also", "some", "than", "then", "make",
+  "just", "like", "more", "over", "such", "each", "were", "being",
+])
 
 /**
  * Full-text keyword search over active knowledge.

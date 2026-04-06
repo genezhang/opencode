@@ -1506,7 +1506,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
                   ZENGRAM_ENABLED
-                    ? Effect.promise(() => recallFacts({ projectId: Instance.project.id, limit: 20 }))
+                    ? Effect.promise(() => {
+                        const userText = lastUserMsg?.parts
+                          .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
+                          .map((p) => p.text)
+                          .join(" ")
+                        return recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined })
+                      })
                     : Effect.succeed([]),
                 ])
                 const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
