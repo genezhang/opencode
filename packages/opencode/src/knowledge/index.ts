@@ -64,20 +64,29 @@ export async function learnFact(input: {
     [id, input.projectId, input.scope, input.subject, input.content,
      input.sourceSession, input.sourceTurn, now, now],
   )
+  // Compute and store embedding server-side via Zeta's embed() function.
+  // Fire-and-forget: embedding is best-effort; retrieval falls back to FTS if null.
+  db.execute(
+    `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
+    [id],
+  ).catch((e) => log.warn("embed on learn failed", { id, err: e }))
   return { id, isNew: true }
 }
 
 /**
  * Fetch active knowledge for a project.
- * When `context` is provided, blends keyword-matched facts with importance-ranked
- * facts so that facts relevant to the current user message surface even if their
- * stored importance is low.
+ *
+ * When `context` is provided:
+ *   1. Try vector similarity via Zeta's embed() — returns semantically relevant
+ *      facts even without exact keyword matches, blended with importance baseline.
+ *   2. Fallback to keyword (ILIKE) + importance blend if embed() is unavailable.
+ * Without context: plain importance-ordered query.
  */
 export async function recallFacts(input: {
   projectId: ProjectID
   scopePrefix?: string
   limit?: number
-  context?: string // optional: user message text for contextual keyword boost
+  context?: string // user message text for contextual recall
 }): Promise<KnowledgeEntry[]> {
   const db = zengramDb()
   const scope = input.scopePrefix ?? "/"
@@ -85,7 +94,52 @@ export async function recallFacts(input: {
   const now = Date.now() * 1000
 
   if (input.context) {
-    // Extract significant keywords (>= 4 chars, not stopwords) from the context.
+    // Path 1: vector similarity (when embed() model is loaded).
+    // Fetches top-k by cosine distance, merged with importance baseline.
+    try {
+      const vecLimit = Math.ceil(limit * 0.6)
+      const [vecMatches, baseline] = await Promise.all([
+        db.query<KnowledgeEntry>(
+          `SELECT id, scope, subject, content, importance, source_session
+           FROM knowledge
+           WHERE project_id = $1
+             AND scope LIKE $2
+             AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3)
+             AND embedding IS NOT NULL
+           ORDER BY embedding <-> embed($4)
+           LIMIT ${vecLimit}`,
+          [input.projectId, `${scope}%`, now, input.context],
+        ),
+        db.query<KnowledgeEntry>(
+          `SELECT id, scope, subject, content, importance, source_session
+           FROM knowledge
+           WHERE project_id = $1
+             AND scope LIKE $2
+             AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3)
+           ORDER BY importance DESC, access_count DESC
+           LIMIT ${vecLimit}`,
+          [input.projectId, `${scope}%`, now],
+        ),
+      ])
+
+      if (vecMatches.length > 0) {
+        // Vector matches first, then importance baseline, deduped.
+        const seen = new Set<string>()
+        const merged: KnowledgeEntry[] = []
+        for (const row of [...vecMatches, ...baseline]) {
+          if (!seen.has(row.id)) { seen.add(row.id); merged.push(row) }
+          if (merged.length >= limit) break
+        }
+        return merged
+      }
+      // embed() returned results but all had NULL embedding → fall through
+    } catch {
+      // embed() not available — fall through to keyword path
+    }
+
+    // Path 2: keyword (ILIKE) + importance blend.
     const words = input.context
       .toLowerCase()
       .replace(/[^a-z0-9\s]/g, " ")
@@ -94,48 +148,38 @@ export async function recallFacts(input: {
     const keywords = [...new Set(words)].slice(0, 8)
 
     if (keywords.length > 0) {
-      // Fetch importance-ranked baseline + keyword matches, deduplicate by id.
-      const baseline = await db.query<KnowledgeEntry>(
-        `SELECT id, scope, subject, content, importance, source_session
-         FROM knowledge
-         WHERE project_id = $1
-           AND scope LIKE $2
-           AND status = 'active'
-           AND (valid_to IS NULL OR valid_to > $3)
-         ORDER BY importance DESC, access_count DESC
-         LIMIT ${Math.ceil(limit * 0.6)}`,
-        [input.projectId, `${scope}%`, now],
-      )
-
-      // Build OR conditions for each keyword
+      const kwLimit = Math.ceil(limit * 0.6)
       const whereParts = keywords.map((_, i) => `(subject ILIKE $${i + 4} OR content ILIKE $${i + 4})`).join(" OR ")
-      const contextMatches = await db.query<KnowledgeEntry>(
-        `SELECT id, scope, subject, content, importance, source_session
-         FROM knowledge
-         WHERE project_id = $1
-           AND scope LIKE $2
-           AND status = 'active'
-           AND (valid_to IS NULL OR valid_to > $3)
-           AND (${whereParts})
-         ORDER BY importance DESC
-         LIMIT ${Math.ceil(limit * 0.6)}`,
-        [input.projectId, `${scope}%`, now, ...keywords.map((k) => `%${k}%`)],
-      )
-      // Merge: context matches first (higher relevance), then baseline, deduplicated.
+      const [kwMatches, baseline] = await Promise.all([
+        db.query<KnowledgeEntry>(
+          `SELECT id, scope, subject, content, importance, source_session
+           FROM knowledge
+           WHERE project_id = $1 AND scope LIKE $2 AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3) AND (${whereParts})
+           ORDER BY importance DESC LIMIT ${kwLimit}`,
+          [input.projectId, `${scope}%`, now, ...keywords.map((k) => `%${k}%`)],
+        ),
+        db.query<KnowledgeEntry>(
+          `SELECT id, scope, subject, content, importance, source_session
+           FROM knowledge
+           WHERE project_id = $1 AND scope LIKE $2 AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3)
+           ORDER BY importance DESC, access_count DESC LIMIT ${kwLimit}`,
+          [input.projectId, `${scope}%`, now],
+        ),
+      ])
       const seen = new Set<string>()
       const merged: KnowledgeEntry[] = []
-      for (const row of [...contextMatches, ...baseline]) {
-        if (!seen.has(row.id)) {
-          seen.add(row.id)
-          merged.push(row)
-        }
+      for (const row of [...kwMatches, ...baseline]) {
+        if (!seen.has(row.id)) { seen.add(row.id); merged.push(row) }
         if (merged.length >= limit) break
       }
       return merged
     }
   }
 
-  const rows = await db.query<KnowledgeEntry>(
+  // No context or no usable keywords: plain importance-ordered query.
+  return db.query<KnowledgeEntry>(
     `SELECT id, scope, subject, content, importance, source_session
      FROM knowledge
      WHERE project_id = $1
@@ -146,7 +190,6 @@ export async function recallFacts(input: {
      LIMIT ${limit}`,
     [input.projectId, `${scope}%`, now],
   )
-  return rows
 }
 
 const STOP_WORDS = new Set([
@@ -157,9 +200,11 @@ const STOP_WORDS = new Set([
 ])
 
 /**
- * Full-text keyword search over active knowledge.
- * Matches against subject and content using ILIKE (case-insensitive substring).
- * Returns up to `limit` entries ordered by importance DESC.
+ * Semantic + keyword search over active knowledge.
+ *
+ * When Zeta's embed() function is available (model files loaded), uses vector
+ * similarity for ranking. Falls back to ILIKE keyword search if embed() is not
+ * loaded or returns an error (e.g. model files absent).
  */
 export async function searchFacts(input: {
   projectId: ProjectID
@@ -168,8 +213,29 @@ export async function searchFacts(input: {
 }): Promise<KnowledgeEntry[]> {
   const db = zengramDb()
   const limit = Math.min(input.limit ?? 20, 100)
-  const pattern = `%${input.query.replace(/[%_]/g, "\\$&")}%`
+  const now = Date.now() * 1000
 
+  // Try vector search first — embed() returns NULL if model not loaded.
+  try {
+    const rows = await db.query<KnowledgeEntry & { vec_dist: number | null }>(
+      `SELECT id, scope, subject, content, importance, source_session,
+              embedding <-> embed($1) AS vec_dist
+       FROM knowledge
+       WHERE project_id = $2
+         AND status = 'active'
+         AND (valid_to IS NULL OR valid_to > $3)
+         AND embedding IS NOT NULL
+       ORDER BY embedding <-> embed($1)
+       LIMIT ${limit}`,
+      [input.query, input.projectId, now],
+    )
+    if (rows.length > 0) return rows
+  } catch {
+    // embed() not available; fall through to keyword search
+  }
+
+  // Fallback: ILIKE keyword search
+  const pattern = `%${input.query.replace(/[%_]/g, "\\$&")}%`
   const rows = await db.query<KnowledgeEntry>(
     `SELECT id, scope, subject, content, importance, source_session
      FROM knowledge
@@ -179,7 +245,7 @@ export async function searchFacts(input: {
        AND (subject ILIKE $3 OR content ILIKE $3)
      ORDER BY importance DESC, access_count DESC
      LIMIT ${limit}`,
-    [input.projectId, Date.now() * 1000, pattern],
+    [input.projectId, now, pattern],
   )
   return rows
 }
@@ -315,6 +381,28 @@ export async function decayKnowledge(input: {
   _lastDecayRun.set(input.projectId, now)
   log.info("knowledge decay", { projectId: input.projectId, updated: count })
   return count
+}
+
+/**
+ * Backfill embeddings for all active knowledge entries that have no embedding.
+ * Calls Zeta's embed() server-side — safe to call fire-and-forget after startup.
+ * Returns the number of rows updated.
+ */
+export async function backfillEmbeddings(input: { projectId: ProjectID }): Promise<number> {
+  const db = zengramDb()
+  try {
+    return await db.execute(
+      `UPDATE knowledge
+       SET embedding = embed(subject || '. ' || content)
+       WHERE project_id = $1
+         AND status = 'active'
+         AND embedding IS NULL`,
+      [input.projectId],
+    )
+  } catch (e) {
+    log.warn("backfillEmbeddings failed (embed() may not be loaded yet)", { err: e })
+    return 0
+  }
 }
 
 /**

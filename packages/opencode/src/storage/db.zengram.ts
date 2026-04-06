@@ -58,14 +58,26 @@ let _client: ZengramClient | null = null
 /** Initialise the Zengram connection. Call once at application startup. */
 export async function initZengram(): Promise<void> {
   if (_client) return
-  _client = await ZengramClient.connect({
-    host: process.env.ZENGRAM_HOST ?? "127.0.0.1",
-    port: parseInt(process.env.ZENGRAM_PORT ?? "5433"),
-    database: process.env.ZENGRAM_DATABASE ?? "zengram",
-    user: process.env.ZENGRAM_USER ?? "zengram",
-    password: process.env.ZENGRAM_PASSWORD,
-    max: 10,
-  })
+
+  const host = process.env.ZENGRAM_HOST ?? "127.0.0.1"
+  const port = parseInt(process.env.ZENGRAM_PORT ?? "5433")
+  const database = process.env.ZENGRAM_DATABASE ?? "zengram"
+  const user = process.env.ZENGRAM_USER ?? "zengram"
+  const password = process.env.ZENGRAM_PASSWORD
+
+  // Ensure the target database exists. Zeta always has "zeta" as default;
+  // a named database must be created before it can be used for queries.
+  // We connect to "zeta" briefly to CREATE DATABASE if it doesn't exist yet.
+  if (database !== "zeta") {
+    const bootstrap = await ZengramClient.connect({ host, port, database: "zeta", user, password, max: 1 })
+    await bootstrap.execute(`CREATE DATABASE IF NOT EXISTS ${database}`, []).catch(() => {
+      // IF NOT EXISTS may not be supported; try without the guard.
+      return bootstrap.execute(`CREATE DATABASE ${database}`, []).catch(() => {/* already exists */})
+    })
+    await bootstrap.close()
+  }
+
+  _client = await ZengramClient.connect({ host, port, database, user, password, max: 10 })
 }
 
 /** Return the active Zengram client. Throws if not initialised. */
