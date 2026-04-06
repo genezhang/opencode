@@ -263,9 +263,7 @@ export namespace ShareNext {
         log.info("full sync", { sessionID })
         const info = yield* session.get(sessionID)
         const diffs = yield* session.diff(sessionID)
-        const messages = ZENGRAM_ENABLED
-          ? yield* Effect.promise(() => Array.fromAsync(MessageV2.zengramStream(sessionID)))
-          : yield* Effect.sync(() => Array.from(MessageV2.stream(sessionID)))
+        const messages = yield* Effect.promise(() => Array.fromAsync(MessageV2.stream(sessionID)))
         const models = yield* Effect.forEach(
           Array.from(
             new Map(

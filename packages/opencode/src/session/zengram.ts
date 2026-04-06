@@ -8,6 +8,15 @@ import { zengramDb } from "@/storage/db.zengram"
 import type { SessionID } from "./schema"
 import type { ProjectID } from "../project/schema"
 
+/**
+ * Convert a Zeta BIGINT timestamp (microseconds, returned as string by pg) to
+ * a JavaScript millisecond timestamp.
+ */
+function ztsToMs(v: string | number | bigint | null | undefined): number | undefined {
+  if (v == null) return undefined
+  return Math.round(Number(v) / 1000)
+}
+
 /** Map a Zengram session row to a Session.Info object. */
 export function zengramRowToSessionInfo(row: Record<string, any>): Session.Info {
   const summary =
@@ -31,12 +40,14 @@ export function zengramRowToSessionInfo(row: Record<string, any>): Session.Info 
     summary,
     share: row.share_url ? { url: row.share_url } : undefined,
     revert: row.revert_state ?? undefined,
-    permission: row.permission_json ? JSON.parse(row.permission_json) : undefined,
+    permission: row.permission_json
+      ? (typeof row.permission_json === "string" ? JSON.parse(row.permission_json) : row.permission_json)
+      : undefined,
     time: {
-      created: typeof row.time_created === "bigint" ? Number(row.time_created) / 1000 : row.time_created,
-      updated: typeof row.time_updated === "bigint" ? Number(row.time_updated) / 1000 : row.time_updated,
-      compacting: row.time_compacting ?? undefined,
-      archived: row.time_archived ?? undefined,
+      created: ztsToMs(row.time_created)!,
+      updated: ztsToMs(row.time_updated)!,
+      compacting: ztsToMs(row.time_compacting),
+      archived: ztsToMs(row.time_archived),
     },
   }
 }
@@ -113,19 +124,26 @@ function buildSessionConditions(opts: SessionListOpts, startIdx: number): { cond
   return { conditions, params, nextIdx: idx }
 }
 
+// Zeta bug: parameterized LIMIT ($N) corrupts the pg wire response.
+// Work around by interpolating LIMIT as a safe literal integer.
+function safeLimit(n: number | undefined, def: number): number {
+  const v = Math.floor(n ?? def)
+  return v > 0 && v <= 10_000 ? v : def
+}
+
 /** List sessions for a project with optional filters. */
 export async function zengramListSessions(opts: SessionListOpts & { projectId: ProjectID }): Promise<Session.Info[]> {
   const db = zengramDb()
-  const { conditions, params, nextIdx } = buildSessionConditions(opts, 2)
+  const { conditions, params } = buildSessionConditions(opts, 2)
   const allConditions = [`project_id = $1`, ...conditions]
-  const limit = opts.limit ?? 50
+  const limit = safeLimit(opts.limit, 50)
 
   const rows = await db.query<Record<string, any>>(
     `SELECT ${SESSION_COLS} FROM session
      WHERE ${allConditions.join(" AND ")}
      ORDER BY time_updated DESC, id DESC
-     LIMIT $${nextIdx}`,
-    [opts.projectId, ...params, limit],
+     LIMIT ${limit}`,
+    [opts.projectId, ...params],
   )
   return rows.map(zengramRowToSessionInfo)
 }
@@ -133,16 +151,16 @@ export async function zengramListSessions(opts: SessionListOpts & { projectId: P
 /** List sessions across all projects (for listGlobal). */
 export async function zengramListSessionsGlobal(opts: SessionListOpts): Promise<Session.Info[]> {
   const db = zengramDb()
-  const { conditions, params, nextIdx } = buildSessionConditions(opts, 1)
-  const limit = opts.limit ?? 100
+  const { conditions, params } = buildSessionConditions(opts, 1)
+  const limit = safeLimit(opts.limit, 100)
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""
 
   const rows = await db.query<Record<string, any>>(
     `SELECT ${SESSION_COLS} FROM session
      ${where}
      ORDER BY time_updated DESC, id DESC
-     LIMIT $${nextIdx}`,
-    [...params, limit],
+     LIMIT ${limit}`,
+    [...params],
   )
   return rows.map(zengramRowToSessionInfo)
 }

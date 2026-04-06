@@ -822,13 +822,16 @@ export namespace MessageV2 {
 
   // ── Zengram read helpers ─────────────────────────────────────────────────
 
+  /** Convert a Zeta BIGINT timestamp (string from pg) to milliseconds. */
+  function ztsToMs(v: string | number | bigint | null | undefined): number | undefined {
+    if (v == null) return undefined
+    return Math.round(Number(v) / 1000)
+  }
+
   /** Reconstruct a MessageV2.Info from a Zengram turn row. */
   function turnToInfo(row: Record<string, any>): MessageV2.Info {
-    const timeMicros = typeof row.time_created === "bigint" ? Number(row.time_created) : row.time_created
-    const timeMs = timeMicros > 1e12 ? timeMicros / 1000 : timeMicros // normalise micro → ms
-    const timeCompletedMs = row.time_completed
-      ? typeof row.time_completed === "bigint" ? Number(row.time_completed) / 1000 : row.time_completed / 1000
-      : undefined
+    const timeMs = ztsToMs(row.time_created)!
+    const timeCompletedMs = ztsToMs(row.time_completed)
     const base = {
       id: row.id as MessageID,
       sessionID: row.session_id as SessionID,
@@ -884,14 +887,15 @@ export namespace MessageV2 {
       params.push(timeMicros, timeMicros, input.before.id)
     }
 
-    params.push(input.limit + 1)
+    // Zeta bug: parameterized LIMIT corrupts pg wire response — use literal integer
+    const fetchLimit = Math.max(1, Math.floor(input.limit + 1))
     const turnRows = await db.query<Record<string, any>>(
       `SELECT id, session_id, role, agent, model_id, provider_id,
               tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
               cost_usd, finish_reason, time_created, time_completed
        FROM turn WHERE ${conditions.join(" AND ")}
        ORDER BY time_created DESC, id DESC
-       LIMIT $${idx}`,
+       LIMIT ${fetchLimit}`,
       params,
     )
 
@@ -924,13 +928,10 @@ export namespace MessageV2 {
     items.reverse()
 
     const tail = slice.at(-1)
-    const timeMicros = tail
-      ? typeof tail.time_created === "bigint" ? Number(tail.time_created) : tail.time_created
-      : 0
     return {
       items,
       more,
-      cursor: more && tail ? cursor.encode({ id: tail.id, time: timeMicros / 1000 }) : undefined,
+      cursor: more && tail ? cursor.encode({ id: tail.id, time: ztsToMs(tail.time_created)! }) : undefined,
     }
   }
 
@@ -950,7 +951,11 @@ export namespace MessageV2 {
 
   // ── end Zengram helpers ───────────────────────────────────────────────────
 
-  export function page(input: { sessionID: SessionID; limit: number; before?: string }) {
+  export async function page(input: { sessionID: SessionID; limit: number; before?: string }) {
+    if (ZENGRAM_ENABLED) {
+      const beforeDecoded = input.before ? cursor.decode(input.before) : undefined
+      return zengramPage({ sessionID: input.sessionID, limit: input.limit, before: beforeDecoded })
+    }
     const before = input.before ? cursor.decode(input.before) : undefined
     const where = before
       ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -987,14 +992,18 @@ export namespace MessageV2 {
     }
   }
 
-  export function* stream(sessionID: SessionID) {
+  export async function* stream(sessionID: SessionID) {
+    if (ZENGRAM_ENABLED) {
+      yield* zengramStream(sessionID)
+      return
+    }
     const size = 50
     let before: string | undefined
     while (true) {
-      const next = page({ sessionID, limit: size, before })
+      const next = await page({ sessionID, limit: size, before })
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {
-        yield next.items[i]
+        yield next.items[i]!
       }
       if (!next.more || !next.cursor) break
       before = next.cursor
