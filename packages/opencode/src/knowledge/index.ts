@@ -95,6 +95,34 @@ export async function recallFacts(input: {
 }
 
 /**
+ * Full-text keyword search over active knowledge.
+ * Matches against subject and content using ILIKE (case-insensitive substring).
+ * Returns up to `limit` entries ordered by importance DESC.
+ */
+export async function searchFacts(input: {
+  projectId: ProjectID
+  query: string
+  limit?: number
+}): Promise<KnowledgeEntry[]> {
+  const db = zengramDb()
+  const limit = Math.min(input.limit ?? 20, 100)
+  const pattern = `%${input.query.replace(/[%_]/g, "\\$&")}%`
+
+  const rows = await db.query<KnowledgeEntry>(
+    `SELECT id, scope, subject, content, importance, source_session
+     FROM knowledge
+     WHERE project_id = $1
+       AND status = 'active'
+       AND (valid_to IS NULL OR valid_to > $2)
+       AND (subject ILIKE $3 OR content ILIKE $3)
+     ORDER BY importance DESC, access_count DESC
+     LIMIT ${limit}`,
+    [input.projectId, Date.now() * 1000, pattern],
+  )
+  return rows
+}
+
+/**
  * Mark a knowledge entry as inactive or superseded.
  * Returns true if the entry was found and updated, false if not found.
  */

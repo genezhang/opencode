@@ -1,0 +1,5 @@
+Search persistent memory for facts matching a keyword or phrase.
+
+Use this tool when you need to explicitly retrieve knowledge from long-term memory that may not have been included in the automatic recall at the start of the session — for example, to look up a specific convention, check what has been remembered about a particular topic, or verify that a fact is stored before adding it again.
+
+Returns matching facts ordered by importance. Results include the knowledge ID, subject, content, and scope.

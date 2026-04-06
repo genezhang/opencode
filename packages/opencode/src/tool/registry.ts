@@ -27,6 +27,7 @@ import { Log } from "@/util/log"
 import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { RememberTool } from "./remember"
 import { ForgetTool } from "./forget"
+import { SearchTool } from "./search"
 import { LspTool } from "./lsp"
 import { Truncate } from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
@@ -158,6 +159,7 @@ export namespace ToolRegistry {
       const plan = yield* build(PlanExitTool)
       const remember = ZENGRAM_ENABLED ? RememberTool : null
       const forget = ZENGRAM_ENABLED ? ForgetTool : null
+      const zengramSearch = ZENGRAM_ENABLED ? SearchTool : null
 
       const all = Effect.fn("ToolRegistry.all")(function* (custom: Tool.Info[]) {
         const cfg = yield* config.get()
@@ -184,6 +186,7 @@ export namespace ToolRegistry {
           ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [plan] : []),
           ...(remember ? [remember] : []),
           ...(forget ? [forget] : []),
+          ...(zengramSearch ? [zengramSearch] : []),
           ...custom,
         ]
       })
