@@ -42,6 +42,8 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
+import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
+import { recallFacts, formatKnowledgeBlock } from "@/knowledge"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
 import { Truncate } from "@/tool/truncate"
@@ -1498,13 +1500,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
                 yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-                const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+                const [skills, env, instructions, modelMsgs, knowledgeFacts] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.skills(agent)),
                   Effect.promise(() => SystemPrompt.environment(model)),
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
+                  ZENGRAM_ENABLED
+                    ? Effect.promise(() => recallFacts({ projectId: Instance.project.id, limit: 20 }))
+                    : Effect.succeed([]),
                 ])
-                const system = [...env, ...(skills ? [skills] : []), ...instructions]
+                const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
+                const system = [
+                  ...env,
+                  ...(skills ? [skills] : []),
+                  ...instructions,
+                  ...(knowledgeBlock ? [knowledgeBlock] : []),
+                ]
                 const format = lastUser.format ?? { type: "text" as const }
                 if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
                 const result = yield* handle.process({

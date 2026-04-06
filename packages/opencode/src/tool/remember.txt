@@ -1,0 +1,9 @@
+Store a fact in persistent memory so it can be recalled in future sessions.
+
+Use this tool when you discover something important and durable about the project or user that should persist across sessions — for example: coding conventions, architectural decisions, user preferences, or recurring patterns.
+
+Do NOT use for temporary or session-specific state. Use for facts that will be useful weeks or months from now.
+
+The subject should be a short noun phrase (e.g. "Error handling convention").
+The content should be a concise, self-contained statement (1-3 sentences).
+The scope controls visibility: "/" for global, "/project" for project-specific.
