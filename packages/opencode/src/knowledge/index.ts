@@ -40,18 +40,35 @@ export async function learnFact(input: {
   const now = Date.now() * 1000
 
   // Check for exact subject duplicate in this scope
-  const existing = await db.query<{ id: string }>(
-    `SELECT id FROM knowledge
+  const existing = await db.query<{ id: string; source_session: string | null }>(
+    `SELECT id, source_session FROM knowledge
      WHERE project_id = $1 AND scope = $2 AND subject = $3 AND status = 'active'
      LIMIT 1`,
     [input.projectId, input.scope, input.subject],
   )
   if (existing[0]) {
-    // Bump access count and update timestamp
-    await db.execute(
-      `UPDATE knowledge SET access_count = access_count + 1, time_updated = $1 WHERE id = $2`,
-      [now, existing[0].id],
-    )
+    const isCrossSession = existing[0].source_session !== input.sourceSession
+    if (isCrossSession) {
+      // Cross-session confirmation: the same fact appeared independently in another
+      // session — boost importance and confidence so it surfaces more in recall.
+      await db.execute(
+        `UPDATE knowledge
+         SET times_confirmed = times_confirmed + 1,
+             importance      = LEAST(1.0, importance + 0.15),
+             confidence      = LEAST(1.0, confidence + 0.1),
+             access_count    = access_count + 1,
+             last_accessed   = $1,
+             time_updated    = $1
+         WHERE id = $2`,
+        [now, existing[0].id],
+      )
+    } else {
+      // Same session re-mention: just record access.
+      await db.execute(
+        `UPDATE knowledge SET access_count = access_count + 1, time_updated = $1 WHERE id = $2`,
+        [now, existing[0].id],
+      )
+    }
     return { id: existing[0].id, isNew: false }
   }
 
