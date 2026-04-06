@@ -388,16 +388,17 @@ export async function decayKnowledge(input: {
  * Calls Zeta's embed() server-side — safe to call fire-and-forget after startup.
  * Returns the number of rows updated.
  */
-export async function backfillEmbeddings(input: { projectId: ProjectID }): Promise<number> {
+export async function backfillEmbeddings(_input?: { projectId?: ProjectID }): Promise<number> {
   const db = zengramDb()
   try {
+    // No project_id filter — embed all active rows that lack an embedding.
+    // Safe to re-run: WHERE embedding IS NULL makes it a no-op once caught up.
     return await db.execute(
       `UPDATE knowledge
        SET embedding = embed(subject || '. ' || content)
-       WHERE project_id = $1
-         AND status = 'active'
+       WHERE status = 'active'
          AND embedding IS NULL`,
-      [input.projectId],
+      [],
     )
   } catch (e) {
     log.warn("backfillEmbeddings failed (embed() may not be loaded yet)", { err: e })

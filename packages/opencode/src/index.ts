@@ -36,7 +36,6 @@ import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
 import { ZENGRAM_ENABLED, initZengram } from "./storage/db.zengram"
 import { backfillEmbeddings } from "./knowledge"
-import { Instance } from "./project/instance"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
@@ -112,7 +111,7 @@ const cli = yargs(args)
       // Backfill any knowledge entries that predate embed() support.
       // Fire-and-forget: runs after startup so it doesn't delay the first request.
       setTimeout(() => {
-        backfillEmbeddings({ projectId: Instance.project.id })
+        backfillEmbeddings()
           .catch(() => {/* embed() may not be loaded yet — that's fine */})
       }, 5000)
     }
