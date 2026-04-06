@@ -3,8 +3,9 @@ import { SyncEvent } from "@/sync"
 import { Session } from "./index"
 import { MessageV2 } from "./message-v2"
 import { SessionTable, MessageTable, PartTable } from "./session.sql"
-import { ProjectTable } from "../project/project.sql"
 import { Log } from "../util/log"
+import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
+import sessionZengramProjectors from "./projectors.zengram"
 
 const log = Log.create({ service: "session.projector" })
 
@@ -61,12 +62,13 @@ export function toPartialRow(info: DeepPartial<Session.Info>) {
   return Object.fromEntries(Object.entries(obj).filter(([_, val]) => val !== undefined))
 }
 
-export default [
-  SyncEvent.project(Session.Event.Created, (db, data) => {
+// SQLite projectors (wrapped as async for the unified interface)
+const sqliteProjectors = [
+  SyncEvent.sqliteProject(Session.Event.Created, (db, data) => {
     db.insert(SessionTable).values(Session.toRow(data.info)).run()
   }),
 
-  SyncEvent.project(Session.Event.Updated, (db, data) => {
+  SyncEvent.sqliteProject(Session.Event.Updated, (db, data) => {
     const info = data.info
     const row = db
       .update(SessionTable)
@@ -77,11 +79,11 @@ export default [
     if (!row) throw new NotFoundError({ message: `Session not found: ${data.sessionID}` })
   }),
 
-  SyncEvent.project(Session.Event.Deleted, (db, data) => {
+  SyncEvent.sqliteProject(Session.Event.Deleted, (db, data) => {
     db.delete(SessionTable).where(eq(SessionTable.id, data.sessionID)).run()
   }),
 
-  SyncEvent.project(MessageV2.Event.Updated, (db, data) => {
+  SyncEvent.sqliteProject(MessageV2.Event.Updated, (db, data) => {
     const time_created = data.info.time.created
     const { id, sessionID, ...rest } = data.info
 
@@ -101,19 +103,19 @@ export default [
     }
   }),
 
-  SyncEvent.project(MessageV2.Event.Removed, (db, data) => {
+  SyncEvent.sqliteProject(MessageV2.Event.Removed, (db, data) => {
     db.delete(MessageTable)
       .where(and(eq(MessageTable.id, data.messageID), eq(MessageTable.session_id, data.sessionID)))
       .run()
   }),
 
-  SyncEvent.project(MessageV2.Event.PartRemoved, (db, data) => {
+  SyncEvent.sqliteProject(MessageV2.Event.PartRemoved, (db, data) => {
     db.delete(PartTable)
       .where(and(eq(PartTable.id, data.partID), eq(PartTable.session_id, data.sessionID)))
       .run()
   }),
 
-  SyncEvent.project(MessageV2.Event.PartUpdated, (db, data) => {
+  SyncEvent.sqliteProject(MessageV2.Event.PartUpdated, (db, data) => {
     const { id, messageID, sessionID, ...rest } = data.part
 
     try {
@@ -133,3 +135,6 @@ export default [
     }
   }),
 ]
+
+// Export the appropriate projectors based on the storage backend
+export default ZENGRAM_ENABLED ? sessionZengramProjectors : sqliteProjectors

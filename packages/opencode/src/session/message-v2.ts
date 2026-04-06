@@ -1,5 +1,6 @@
 import { BusEvent } from "@/bus/bus-event"
 import { SessionID, MessageID, PartID } from "./schema"
+import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
 import z from "zod"
 import { NamedError } from "@opencode-ai/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
@@ -818,6 +819,136 @@ export namespace MessageV2 {
   ): Promise<ModelMessage[]> {
     return Effect.runPromise(toModelMessagesEffect(input, model, options))
   }
+
+  // ── Zengram read helpers ─────────────────────────────────────────────────
+
+  /** Reconstruct a MessageV2.Info from a Zengram turn row. */
+  function turnToInfo(row: Record<string, any>): MessageV2.Info {
+    const timeMicros = typeof row.time_created === "bigint" ? Number(row.time_created) : row.time_created
+    const timeMs = timeMicros > 1e12 ? timeMicros / 1000 : timeMicros // normalise micro → ms
+    const timeCompletedMs = row.time_completed
+      ? typeof row.time_completed === "bigint" ? Number(row.time_completed) / 1000 : row.time_completed / 1000
+      : undefined
+    const base = {
+      id: row.id as MessageID,
+      sessionID: row.session_id as SessionID,
+      role: row.role as "user" | "assistant",
+      agent: row.agent ?? undefined,
+      time: { created: timeMs, completed: timeCompletedMs },
+    }
+    if (row.role === "assistant") {
+      return {
+        ...base,
+        modelID: row.model_id ?? undefined,
+        providerID: row.provider_id ?? undefined,
+        tokens: {
+          input: row.tokens_input ?? 0,
+          output: row.tokens_output ?? 0,
+          reasoning: row.tokens_reasoning ?? 0,
+          cache: {
+            read: row.tokens_cache_read ?? 0,
+            write: row.tokens_cache_write ?? 0,
+          },
+        },
+        cost: row.cost_usd ?? 0,
+        finish: row.finish_reason ?? undefined,
+      } as unknown as MessageV2.Info
+    }
+    return base as unknown as MessageV2.Info
+  }
+
+  /** Reconstruct a MessageV2.Part from a Zengram part row. */
+  function zengramPartToMessagePart(row: Record<string, any>): MessageV2.Part {
+    return {
+      ...(row.data ?? {}),
+      id: row.id as PartID,
+      sessionID: row.session_id as SessionID,
+      messageID: row.turn_id as MessageID,
+    } as MessageV2.Part
+  }
+
+  /** Fetch messages with their parts from Zengram. */
+  export async function zengramPage(input: {
+    sessionID: SessionID
+    limit: number
+    before?: { id: string; time: number }
+  }): Promise<{ items: WithParts[]; more: boolean; cursor?: string }> {
+    const db = zengramDb()
+    const conditions: string[] = ["session_id = $1"]
+    const params: unknown[] = [input.sessionID]
+    let idx = 2
+
+    if (input.before) {
+      conditions.push(`(time_created < $${idx++} OR (time_created = $${idx++} AND id < $${idx++}))`)
+      const timeMicros = input.before.time * 1000
+      params.push(timeMicros, timeMicros, input.before.id)
+    }
+
+    params.push(input.limit + 1)
+    const turnRows = await db.query<Record<string, any>>(
+      `SELECT id, session_id, role, agent, model_id, provider_id,
+              tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+              cost_usd, finish_reason, time_created, time_completed
+       FROM turn WHERE ${conditions.join(" AND ")}
+       ORDER BY time_created DESC, id DESC
+       LIMIT $${idx}`,
+      params,
+    )
+
+    const more = turnRows.length > input.limit
+    const slice = more ? turnRows.slice(0, input.limit) : turnRows
+    const ids = slice.map((r) => r.id)
+
+    // Fetch all parts for these turns
+    const partByTurn = new Map<string, MessageV2.Part[]>()
+    if (ids.length > 0) {
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(", ")
+      const partRows = await db.query<Record<string, any>>(
+        `SELECT id, turn_id, session_id, type, data, position FROM part
+         WHERE turn_id IN (${placeholders})
+         ORDER BY turn_id, position ASC`,
+        ids,
+      )
+      for (const row of partRows) {
+        const p = zengramPartToMessagePart(row)
+        const list = partByTurn.get(row.turn_id)
+        if (list) list.push(p)
+        else partByTurn.set(row.turn_id, [p])
+      }
+    }
+
+    const items = slice.map((row) => ({
+      info: turnToInfo(row),
+      parts: partByTurn.get(row.id) ?? [],
+    }))
+    items.reverse()
+
+    const tail = slice.at(-1)
+    const timeMicros = tail
+      ? typeof tail.time_created === "bigint" ? Number(tail.time_created) : tail.time_created
+      : 0
+    return {
+      items,
+      more,
+      cursor: more && tail ? cursor.encode({ id: tail.id, time: timeMicros / 1000 }) : undefined,
+    }
+  }
+
+  export async function* zengramStream(sessionID: SessionID) {
+    const size = 50
+    let before: { id: string; time: number } | undefined
+    while (true) {
+      const next = await zengramPage({ sessionID, limit: size, before })
+      if (next.items.length === 0) break
+      for (let i = next.items.length - 1; i >= 0; i--) {
+        yield next.items[i]!
+      }
+      if (!next.more || !next.cursor) break
+      before = cursor.decode(next.cursor)
+    }
+  }
+
+  // ── end Zengram helpers ───────────────────────────────────────────────────
 
   export function page(input: { sessionID: SessionID; limit: number; before?: string }) {
     const before = input.before ? cursor.decode(input.before) : undefined

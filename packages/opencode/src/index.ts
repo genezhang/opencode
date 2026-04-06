@@ -34,6 +34,7 @@ import { Global } from "./global"
 import { JsonMigration } from "./storage/json-migration"
 import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
+import { ZENGRAM_ENABLED, initZengram } from "./storage/db.zengram"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
@@ -102,6 +103,11 @@ const cli = yargs(args)
     process.env.AGENT = "1"
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
+
+    // Initialise Zengram storage backend if requested
+    if (ZENGRAM_ENABLED) {
+      await initZengram()
+    }
 
     Log.Default.info("opencode", {
       version: Installation.VERSION,
