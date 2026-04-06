@@ -5,9 +5,11 @@
  * table. Only active when OPENCODE_STORAGE=zengram.
  */
 
+import { generateText } from "ai"
 import { zengramDb } from "@/storage/db.zengram"
 import { ulid } from "ulid"
 import { Log } from "@/util/log"
+import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
 
@@ -111,47 +113,26 @@ export async function recallFacts(input: {
   const now = Date.now() * 1000
 
   if (input.context) {
-    // Path 1: vector similarity (when embed() model is loaded).
-    // Fetches top-k by cosine distance, merged with importance baseline.
+    // Path 1: hybrid vector + importance scoring (when embed() model is loaded).
+    // score = 0.7 * (1 - cosine_dist/2) + 0.3 * importance
+    // cosine distance is in [0,2] so (1 - dist/2) normalises to [0,1].
+    // Rows without embeddings are excluded here; the fallback below covers them.
     try {
-      const vecLimit = Math.ceil(limit * 0.6)
-      const [vecMatches, baseline] = await Promise.all([
-        db.query<KnowledgeEntry>(
-          `SELECT id, scope, subject, content, importance, source_session
-           FROM knowledge
-           WHERE project_id = $1
-             AND scope LIKE $2
-             AND status = 'active'
-             AND (valid_to IS NULL OR valid_to > $3)
-             AND embedding IS NOT NULL
-           ORDER BY embedding <-> embed($4)
-           LIMIT ${vecLimit}`,
-          [input.projectId, `${scope}%`, now, input.context],
-        ),
-        db.query<KnowledgeEntry>(
-          `SELECT id, scope, subject, content, importance, source_session
-           FROM knowledge
-           WHERE project_id = $1
-             AND scope LIKE $2
-             AND status = 'active'
-             AND (valid_to IS NULL OR valid_to > $3)
-           ORDER BY importance DESC, access_count DESC
-           LIMIT ${vecLimit}`,
-          [input.projectId, `${scope}%`, now],
-        ),
-      ])
+      const vecMatches = await db.query<KnowledgeEntry>(
+        `SELECT id, scope, subject, content, importance, source_session
+         FROM knowledge
+         WHERE project_id = $1
+           AND scope LIKE $2
+           AND status = 'active'
+           AND (valid_to IS NULL OR valid_to > $3)
+           AND embedding IS NOT NULL
+         ORDER BY (0.7 * (1.0 - (embedding <-> embed($4)) / 2.0) + 0.3 * importance) DESC
+         LIMIT ${limit}`,
+        [input.projectId, `${scope}%`, now, input.context],
+      )
 
-      if (vecMatches.length > 0) {
-        // Vector matches first, then importance baseline, deduped.
-        const seen = new Set<string>()
-        const merged: KnowledgeEntry[] = []
-        for (const row of [...vecMatches, ...baseline]) {
-          if (!seen.has(row.id)) { seen.add(row.id); merged.push(row) }
-          if (merged.length >= limit) break
-        }
-        return merged
-      }
-      // embed() returned results but all had NULL embedding → fall through
+      if (vecMatches.length > 0) return vecMatches
+      // No rows with embeddings → fall through to keyword path
     } catch {
       // embed() not available — fall through to keyword path
     }
@@ -232,17 +213,17 @@ export async function searchFacts(input: {
   const limit = Math.min(input.limit ?? 20, 100)
   const now = Date.now() * 1000
 
-  // Try vector search first — embed() returns NULL if model not loaded.
+  // Hybrid vector + importance scoring (when embed() model is loaded).
+  // score = 0.7 * (1 - cosine_dist/2) + 0.3 * importance
   try {
-    const rows = await db.query<KnowledgeEntry & { vec_dist: number | null }>(
-      `SELECT id, scope, subject, content, importance, source_session,
-              embedding <-> embed($1) AS vec_dist
+    const rows = await db.query<KnowledgeEntry>(
+      `SELECT id, scope, subject, content, importance, source_session
        FROM knowledge
        WHERE project_id = $2
          AND status = 'active'
          AND (valid_to IS NULL OR valid_to > $3)
          AND embedding IS NOT NULL
-       ORDER BY embedding <-> embed($1)
+       ORDER BY (0.7 * (1.0 - (embedding <-> embed($1)) / 2.0) + 0.3 * importance) DESC
        LIMIT ${limit}`,
       [input.query, input.projectId, now],
     )
@@ -342,8 +323,23 @@ export async function extractAndLearn(input: {
 
   if (fullText.length < 100) return 0 // Too short to extract from
 
-  const facts = extractFacts(fullText)
-  log.info("passive extraction", { turnId: input.turnId, textLen: fullText.length, candidates: facts.length })
+  // Heuristic extraction runs on every turn.
+  const heuristicFacts = extractFacts(fullText)
+
+  // LLM extraction runs on high-value turns (>2 000 chars) — better quality,
+  // but costs a cheap model call. Fire-and-forget from caller's perspective;
+  // we await it here since extractAndLearn is already called fire-and-forget.
+  const llmFacts = fullText.length >= 2000 ? await extractFactsWithLlm(fullText) : []
+
+  const facts = mergeExtracted(heuristicFacts, llmFacts)
+  log.info("passive extraction", {
+    turnId: input.turnId,
+    textLen: fullText.length,
+    heuristic: heuristicFacts.length,
+    llm: llmFacts.length,
+    total: facts.length,
+  })
+
   let stored = 0
   for (const fact of facts) {
     const { isNew } = await learnFact({
@@ -358,6 +354,56 @@ export async function extractAndLearn(input: {
   }
   log.info("passive extraction done", { turnId: input.turnId, stored })
   return stored
+}
+
+/**
+ * Use a cheap LLM call to extract up to 5 durable facts from a turn.
+ * Returns [] on any failure (model unavailable, parse error, etc.).
+ */
+async function extractFactsWithLlm(text: string): Promise<Array<{ subject: string; content: string }>> {
+  try {
+    const modelRef = await Provider.defaultModel()
+    const smallModel = await Provider.getSmallModel(modelRef.providerID)
+    const fullModel = smallModel ?? (await Provider.getModel(modelRef.providerID, modelRef.modelID))
+    const language = await Provider.getLanguage(fullModel)
+
+    const { text: output } = await generateText({
+      model: language,
+      system:
+        "Extract up to 5 durable, project-specific facts from this AI assistant message. " +
+        "Return a JSON array of objects with 'subject' (< 60 chars, a short title) and " +
+        "'content' (< 200 chars, the complete fact). Only include normative, reusable facts — " +
+        "conventions, constraints, patterns, rules. Return [] if none qualify. " +
+        "Respond with raw JSON only, no markdown fences.",
+      prompt: text.slice(0, 4000),
+    })
+
+    const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
+    const parsed = JSON.parse(cleaned)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (f): f is { subject: string; content: string } =>
+        typeof f?.subject === "string" && typeof f?.content === "string",
+    )
+  } catch (e) {
+    log.warn("llm extraction failed", { err: e })
+    return []
+  }
+}
+
+/** Merge heuristic + LLM facts, deduping by subject. LLM facts take priority. */
+function mergeExtracted(
+  heuristic: Array<{ subject: string; content: string }>,
+  llm: Array<{ subject: string; content: string }>,
+): Array<{ subject: string; content: string }> {
+  const seen = new Set<string>()
+  const out: Array<{ subject: string; content: string }> = []
+  for (const f of [...llm, ...heuristic]) {
+    const key = f.subject.toLowerCase().slice(0, 40)
+    if (!seen.has(key)) { seen.add(key); out.push(f) }
+    if (out.length >= 8) break
+  }
+  return out
 }
 
 // Track when decay last ran per project to avoid running it on every turn.
