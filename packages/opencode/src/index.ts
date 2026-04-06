@@ -36,6 +36,10 @@ import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { ZENGRAM_ENABLED, initZengram, zengramPool } from "./storage/db.zengram"
+import { backfillEmbeddings } from "./knowledge"
+import { ensureZeta } from "./storage/zeta-process"
+import { runMigrations } from "./storage/zengram-migrate"
 
 process.on("unhandledRejection", (e) => {
   Log.Default.error("rejection", {
@@ -102,6 +106,19 @@ const cli = yargs(args)
     process.env.AGENT = "1"
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
+
+    // Initialise Zengram storage backend if requested.
+    if (ZENGRAM_ENABLED) {
+      // Start a local Zeta subprocess if no external server is configured.
+      const zetaPort = await ensureZeta()
+      if (zetaPort !== null) process.env.ZENGRAM_PORT = String(zetaPort)
+      await initZengram()
+      await runMigrations(zengramPool())
+      // Backfill embeddings fire-and-forget — model files may still be downloading.
+      setTimeout(() => {
+        backfillEmbeddings().catch(() => {})
+      }, 10_000)
+    }
 
     Log.Default.info("opencode", {
       version: Installation.VERSION,
