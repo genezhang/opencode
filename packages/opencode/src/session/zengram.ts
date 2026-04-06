@@ -73,10 +73,7 @@ export async function zengramGetChildren(
   return rows.map(zengramRowToSessionInfo)
 }
 
-/** List sessions for a project with optional filters. */
-export async function zengramListSessions(opts: {
-  projectId: ProjectID
-  workspaceId?: string
+type SessionListOpts = {
   directory?: string
   excludeChildren?: boolean
   since?: number
@@ -84,16 +81,13 @@ export async function zengramListSessions(opts: {
   search?: string
   includeArchived?: boolean
   limit?: number
-}): Promise<Session.Info[]> {
-  const db = zengramDb()
-  const conditions: string[] = ["project_id = $1"]
-  const params: unknown[] = [opts.projectId]
-  let idx = 2
+}
 
-  if (opts.workspaceId) {
-    conditions.push(`workspace_id = $${idx++}`)
-    params.push(opts.workspaceId)
-  }
+function buildSessionConditions(opts: SessionListOpts, startIdx: number): { conditions: string[]; params: unknown[]; nextIdx: number } {
+  const conditions: string[] = []
+  const params: unknown[] = []
+  let idx = startIdx
+
   if (opts.directory) {
     conditions.push(`directory = $${idx++}`)
     params.push(opts.directory)
@@ -116,16 +110,39 @@ export async function zengramListSessions(opts: {
   if (!opts.includeArchived) {
     conditions.push(`time_archived IS NULL`)
   }
+  return { conditions, params, nextIdx: idx }
+}
 
+/** List sessions for a project with optional filters. */
+export async function zengramListSessions(opts: SessionListOpts & { projectId: ProjectID }): Promise<Session.Info[]> {
+  const db = zengramDb()
+  const { conditions, params, nextIdx } = buildSessionConditions(opts, 2)
+  const allConditions = [`project_id = $1`, ...conditions]
   const limit = opts.limit ?? 50
-  params.push(limit)
 
   const rows = await db.query<Record<string, any>>(
     `SELECT ${SESSION_COLS} FROM session
-     WHERE ${conditions.join(" AND ")}
+     WHERE ${allConditions.join(" AND ")}
      ORDER BY time_updated DESC, id DESC
-     LIMIT $${idx}`,
-    params,
+     LIMIT $${nextIdx}`,
+    [opts.projectId, ...params, limit],
+  )
+  return rows.map(zengramRowToSessionInfo)
+}
+
+/** List sessions across all projects (for listGlobal). */
+export async function zengramListSessionsGlobal(opts: SessionListOpts): Promise<Session.Info[]> {
+  const db = zengramDb()
+  const { conditions, params, nextIdx } = buildSessionConditions(opts, 1)
+  const limit = opts.limit ?? 100
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""
+
+  const rows = await db.query<Record<string, any>>(
+    `SELECT ${SESSION_COLS} FROM session
+     ${where}
+     ORDER BY time_updated DESC, id DESC
+     LIMIT $${nextIdx}`,
+    [...params, limit],
   )
   return rows.map(zengramRowToSessionInfo)
 }

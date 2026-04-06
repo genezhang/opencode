@@ -15,7 +15,7 @@ import type { SQL } from "../storage/db"
 import { SessionTable } from "./session.sql"
 import { ProjectTable } from "../project/project.sql"
 import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
-import { zengramGetSession, zengramGetChildren, zengramListSessions, zengramGetProjectSummaries } from "./zengram"
+import { zengramGetSession, zengramGetChildren, zengramListSessions, zengramListSessionsGlobal, zengramGetProjectSummaries } from "./zengram"
 import { Storage } from "@/storage/storage"
 import { Log } from "../util/log"
 import { updateSchema } from "../util/update-schema"
@@ -830,10 +830,7 @@ export namespace Session {
     archived?: boolean
   }) {
     if (ZENGRAM_ENABLED) {
-      // For listGlobal we don't have a single projectId filter.
-      // Run a broad query and join with project info.
-      const sessions = await zengramListSessions({
-        projectId: "%" as any, // Not ideal — see TODO below
+      const sessions = await zengramListSessionsGlobal({
         directory: input?.directory,
         excludeChildren: input?.roots,
         since: input?.start,
@@ -842,8 +839,6 @@ export namespace Session {
         includeArchived: !!input?.archived,
         limit: input?.limit ?? 100,
       })
-      // TODO: listGlobal in Zengram mode needs a cross-project query.
-      // For now, fetch distinct project IDs from results and look them up.
       const projectIds = [...new Set(sessions.map((s) => s.projectID))]
       const projectRows = await zengramGetProjectSummaries(projectIds)
       const projectMap = new Map(projectRows.map((p) => [p.id, p]))
