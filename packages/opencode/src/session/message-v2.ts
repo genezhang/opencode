@@ -1016,7 +1016,15 @@ export namespace MessageV2 {
     }
   }
 
-  export function parts(message_id: MessageID) {
+  export async function parts(message_id: MessageID): Promise<MessageV2.Part[]> {
+    if (ZENGRAM_ENABLED) {
+      const db = zengramDb()
+      const rows = await db.query<Record<string, any>>(
+        `SELECT id, turn_id, session_id, type, data, position FROM part WHERE turn_id = $1 ORDER BY position ASC`,
+        [message_id],
+      )
+      return rows.map((row) => zengramPartToMessagePart(row))
+    }
     const rows = Database.use((db) =>
       db.select().from(PartTable).where(eq(PartTable.message_id, message_id)).orderBy(PartTable.id).all(),
     )
@@ -1031,7 +1039,19 @@ export namespace MessageV2 {
     )
   }
 
-  export function get(input: { sessionID: SessionID; messageID: MessageID }): WithParts {
+  export async function get(input: { sessionID: SessionID; messageID: MessageID }): Promise<WithParts> {
+    if (ZENGRAM_ENABLED) {
+      const db = zengramDb()
+      const turnRows = await db.query<Record<string, any>>(
+        `SELECT id, session_id, role, agent, model_id, provider_id,
+                tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+                cost_usd, finish_reason, time_created, time_completed
+         FROM turn WHERE id = $1 AND session_id = $2`,
+        [input.messageID, input.sessionID],
+      )
+      if (!turnRows[0]) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
+      return { info: turnToInfo(turnRows[0]), parts: await parts(input.messageID) }
+    }
     const row = Database.use((db) =>
       db
         .select()
@@ -1042,7 +1062,7 @@ export namespace MessageV2 {
     if (!row) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
     return {
       info: info(row),
-      parts: parts(input.messageID),
+      parts: await parts(input.messageID),
     }
   }
 
