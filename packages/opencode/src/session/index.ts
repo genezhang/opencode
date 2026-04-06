@@ -619,9 +619,9 @@ export namespace Session {
           })
         }
         if (input.limit) {
-          return MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).items
+          return (yield* Effect.promise(() => MessageV2.page({ sessionID: input.sessionID, limit: input.limit! }))).items
         }
-        return Array.from(MessageV2.stream(input.sessionID)).reverse()
+        return (yield* Effect.promise(() => Array.fromAsync(MessageV2.stream(input.sessionID)))).reverse()
       })
 
       const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {

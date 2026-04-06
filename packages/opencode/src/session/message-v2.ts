@@ -857,7 +857,13 @@ export namespace MessageV2 {
         finish: row.finish_reason ?? undefined,
       } as unknown as MessageV2.Info
     }
-    return base as unknown as MessageV2.Info
+    // User message: reconstruct the nested model object from stored columns
+    return {
+      ...base,
+      model: row.model_id && row.provider_id
+        ? { modelID: row.model_id, providerID: row.provider_id }
+        : undefined,
+    } as unknown as MessageV2.Info
   }
 
   /** Reconstruct a MessageV2.Part from a Zengram part row. */
@@ -1059,7 +1065,8 @@ export namespace MessageV2 {
   }
 
   export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
-    return filterCompacted(stream(sessionID))
+    const msgs = yield* Effect.promise(() => Array.fromAsync(stream(sessionID)))
+    return filterCompacted(msgs)
   })
 
   export function fromError(

@@ -137,8 +137,9 @@ export default [
     // Map MessageV2.Info fields to turn columns
     const role = (info as any).role ?? "user"
     const agent = (info as any).agent ?? null
-    const modelId = (info as any).modelID ?? null
-    const providerId = (info as any).providerID ?? null
+    // Assistant has flat modelID/providerID; User has model: { modelID, providerID }
+    const modelId = (info as any).modelID ?? (info as any).model?.modelID ?? null
+    const providerId = (info as any).providerID ?? (info as any).model?.providerID ?? null
     const tokensInput = (info as any).tokens?.input ?? 0
     const tokensOutput = (info as any).tokens?.output ?? 0
     const tokensReasoning = (info as any).tokens?.reasoning ?? 0
