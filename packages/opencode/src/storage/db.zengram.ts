@@ -91,6 +91,14 @@ export function zengramDb(): Queryable {
   return _client
 }
 
+/** Return the raw pg.Pool for operations that need transaction control (e.g. migrations). */
+export function zengramPool(): pg.Pool {
+  if (!_client) {
+    throw new Error("Zengram client not initialised.")
+  }
+  return (_client as ZengramClient)["pool"] as pg.Pool
+}
+
 /** Whether Zengram storage is enabled for this process. */
 export const ZENGRAM_ENABLED = process.env.OPENCODE_STORAGE === "zengram"
 

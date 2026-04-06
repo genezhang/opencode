@@ -34,8 +34,10 @@ import { Global } from "./global"
 import { JsonMigration } from "./storage/json-migration"
 import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
-import { ZENGRAM_ENABLED, initZengram } from "./storage/db.zengram"
+import { ZENGRAM_ENABLED, initZengram, zengramPool } from "./storage/db.zengram"
 import { backfillEmbeddings } from "./knowledge"
+import { ensureZeta } from "./storage/zeta-process"
+import { runMigrations } from "./storage/zengram-migrate"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
@@ -105,15 +107,23 @@ const cli = yargs(args)
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
 
-    // Initialise Zengram storage backend if requested
+    // Initialise Zengram storage backend if requested.
     if (ZENGRAM_ENABLED) {
+      // Start a local Zeta subprocess if no external server is configured.
+      // Returns the port to use, or null if an external server is configured.
+      const zetaPort = await ensureZeta()
+      if (zetaPort !== null) process.env.ZENGRAM_PORT = String(zetaPort)
+
       await initZengram()
-      // Backfill any knowledge entries that predate embed() support.
-      // Fire-and-forget: runs after startup so it doesn't delay the first request.
+      await runMigrations(zengramPool())
+
+      // Backfill embeddings for knowledge entries that predate embed() support.
+      // Fire-and-forget: runs after startup so it doesn't block the first request.
+      // Model files may still be downloading — embed() fails gracefully until ready.
       setTimeout(() => {
         backfillEmbeddings()
           .catch(() => {/* embed() may not be loaded yet — that's fine */})
-      }, 5000)
+      }, 10_000)
     }
 
     Log.Default.info("opencode", {
