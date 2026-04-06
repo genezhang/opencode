@@ -7,8 +7,11 @@
 
 import { zengramDb } from "@/storage/db.zengram"
 import { ulid } from "ulid"
+import { Log } from "@/util/log"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
+
+const log = Log.create({ service: "knowledge" })
 
 export type KnowledgeScope = string // "/" = global, "/project" = project-scoped
 
@@ -89,6 +92,99 @@ export async function recallFacts(input: {
     [input.projectId, `${scope}%`, Date.now() * 1000],
   )
   return rows
+}
+
+/**
+ * Mark a knowledge entry as inactive or superseded.
+ * Returns true if the entry was found and updated, false if not found.
+ */
+export async function forgetFact(input: { id: string; supersededBy?: string }): Promise<boolean> {
+  const db = zengramDb()
+  const now = Date.now() * 1000
+  const status = input.supersededBy ? "superseded" : "inactive"
+
+  const rowCount = input.supersededBy
+    ? await db.execute(
+        `UPDATE knowledge SET status = $1, valid_to = $2, superseded_by = $3, time_updated = $4 WHERE id = $5 AND status = 'active'`,
+        [status, now, input.supersededBy, now, input.id],
+      )
+    : await db.execute(
+        `UPDATE knowledge SET status = $1, valid_to = $2, time_updated = $3 WHERE id = $4 AND status = 'active'`,
+        [status, now, now, input.id],
+      )
+  return rowCount > 0
+}
+
+// Patterns that signal a normative/durable statement worth remembering.
+const NORMATIVE_RE = /\b(always|never|should(?:n't)?|must(?:n't)?|convention|important|note that|remember that|rule|policy|guideline|don't forget|be aware|best practice|recommend|prefer|avoid|use\b|don't\b)\b/i
+// Sentences beginning with an imperative verb (e.g. "Use enums", "Avoid panicking")
+const IMPERATIVE_START_RE = /^(?:\d+\.\s+)?\*{0,2}(Use|Avoid|Prefer|Don't|Never|Always|Make sure|Ensure|Keep|Write|Return|Handle|Check|Wrap|Implement)\b/i
+
+/**
+ * Heuristic extraction: scan assistant turn text for normative sentences.
+ * Returns up to `maxFacts` extracted {subject, content} pairs.
+ * No LLM call needed — purely rule-based.
+ */
+export function extractFacts(text: string, maxFacts = 3): Array<{ subject: string; content: string }> {
+  const sentences = text
+    .replace(/```[\s\S]*?```/g, "") // strip code blocks
+    .replace(/\*\*/g, "")           // strip bold markers
+    .split(/\n+|(?<=[.!?])\s{2,}/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 30 && s.length < 400)
+
+  const hits: Array<{ subject: string; content: string }> = []
+  for (const sentence of sentences) {
+    if (!NORMATIVE_RE.test(sentence) && !IMPERATIVE_START_RE.test(sentence)) continue
+    // Strip leading list markers and bold
+    const clean = sentence.replace(/^\d+\.\s+/, "").replace(/\*\*/g, "").trim()
+    const subject = clean.split(/[—\-,:;]/)[0].slice(0, 70).trim()
+    if (subject.length < 8) continue
+    hits.push({ subject, content: clean })
+    if (hits.length >= maxFacts) break
+  }
+  return hits
+}
+
+/**
+ * Extract facts from a completed assistant turn and persist them.
+ * Called automatically after each assistant turn finishes.
+ */
+export async function extractAndLearn(input: {
+  projectId: ProjectID
+  sessionId: SessionID
+  turnId: MessageID
+}): Promise<number> {
+  const db = zengramDb()
+
+  // Gather text from all text-type parts for this turn
+  const parts = await db.query<{ data: any }>(
+    `SELECT data FROM part WHERE turn_id = $1 AND type = 'text' ORDER BY position ASC`,
+    [input.turnId],
+  )
+  const fullText = parts
+    .map((p) => (typeof p.data === "string" ? p.data : (p.data as any)?.text ?? ""))
+    .join("\n")
+    .trim()
+
+  if (fullText.length < 100) return 0 // Too short to extract from
+
+  const facts = extractFacts(fullText)
+  log.info("passive extraction", { turnId: input.turnId, textLen: fullText.length, candidates: facts.length })
+  let stored = 0
+  for (const fact of facts) {
+    const { isNew } = await learnFact({
+      projectId: input.projectId,
+      scope: "/project",
+      subject: fact.subject,
+      content: fact.content,
+      sourceSession: input.sessionId,
+      sourceTurn: input.turnId,
+    })
+    if (isNew) stored++
+  }
+  log.info("passive extraction done", { turnId: input.turnId, stored })
+  return stored
 }
 
 /**

@@ -1,0 +1,5 @@
+Mark a stored memory as inactive (forgotten) or superseded by new information.
+
+Use this when you discover that a previously stored fact is wrong, outdated, or has been replaced by something more accurate. You must provide the knowledge ID (returned when the fact was stored, or visible in recalled facts).
+
+If you have a replacement fact, store the new one first with zengram_remember, then call zengram_forget with the old ID and the new ID as superseded_by.

@@ -17,6 +17,8 @@ import { MessageV2 } from "./message-v2"
 import { zengramDb } from "@/storage/db.zengram"
 import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
+import { extractAndLearn } from "@/knowledge"
+import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "session.projector.zengram" })
 
@@ -171,6 +173,16 @@ export default [
         timeCompleted ? timeCompleted * 1000 : null,
       ],
     )
+
+    // Passive extraction: when an assistant turn completes, scan for durable facts.
+    // Fire-and-forget — never blocks the main event path.
+    if (role === "assistant" && finishReason) {
+      extractAndLearn({
+        projectId: Instance.project.id,
+        sessionId: info.sessionID,
+        turnId: info.id,
+      }).catch((err) => log.warn("passive extraction failed", { err }))
+    }
   }),
 
   SyncEvent.project(MessageV2.Event.Removed, async (data) => {

@@ -26,6 +26,7 @@ import { Flag } from "@/flag/flag"
 import { Log } from "@/util/log"
 import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { RememberTool } from "./remember"
+import { ForgetTool } from "./forget"
 import { LspTool } from "./lsp"
 import { Truncate } from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
@@ -156,6 +157,7 @@ export namespace ToolRegistry {
       const batch = yield* build(BatchTool)
       const plan = yield* build(PlanExitTool)
       const remember = ZENGRAM_ENABLED ? RememberTool : null
+      const forget = ZENGRAM_ENABLED ? ForgetTool : null
 
       const all = Effect.fn("ToolRegistry.all")(function* (custom: Tool.Info[]) {
         const cfg = yield* config.get()
@@ -181,6 +183,7 @@ export namespace ToolRegistry {
           ...(cfg.experimental?.batch_tool === true ? [batch] : []),
           ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [plan] : []),
           ...(remember ? [remember] : []),
+          ...(forget ? [forget] : []),
           ...custom,
         ]
       })
