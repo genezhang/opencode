@@ -215,6 +215,46 @@ export async function extractAndLearn(input: {
   return stored
 }
 
+// Track when decay last ran per project to avoid running it on every turn.
+const _lastDecayRun = new Map<string, number>()
+const DECAY_INTERVAL_MS = 24 * 60 * 60 * 1000 // at most once per day per project
+
+/**
+ * Exponential importance decay on all active knowledge for a project.
+ * Mirrors the Rust decay.rs logic: importance *= 0.5 ^ (elapsed_days / half_life_days).
+ * Throttled to run at most once per day per project — safe to call fire-and-forget.
+ */
+export async function decayKnowledge(input: {
+  projectId: ProjectID
+  halfLifeDays?: number
+}): Promise<number> {
+  const now = Date.now()
+  const lastRun = _lastDecayRun.get(input.projectId) ?? 0
+  if (now - lastRun < DECAY_INTERVAL_MS) return 0
+
+  const db = zengramDb()
+  const halfLife = input.halfLifeDays ?? 30
+  const nowMicros = now * 1000
+  const microsPerDay = 86_400_000_000
+
+  const count = await db.execute(
+    `UPDATE knowledge
+     SET importance = importance * POWER(0.5,
+           CAST(($1 - COALESCE(last_accessed, time_created)) AS DOUBLE PRECISION)
+           / ${microsPerDay}
+           / ${halfLife}),
+         last_accessed = $1,
+         time_updated = $1
+     WHERE project_id = $2
+       AND status = 'active'
+       AND importance > 0.01`,
+    [nowMicros, input.projectId],
+  )
+  _lastDecayRun.set(input.projectId, now)
+  log.info("knowledge decay", { projectId: input.projectId, updated: count })
+  return count
+}
+
 /**
  * Format recalled knowledge as a system-prompt block.
  * Returns null if there's nothing to inject.

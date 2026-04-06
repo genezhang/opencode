@@ -17,7 +17,7 @@ import { MessageV2 } from "./message-v2"
 import { zengramDb } from "@/storage/db.zengram"
 import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
-import { extractAndLearn } from "@/knowledge"
+import { extractAndLearn, decayKnowledge } from "@/knowledge"
 import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "session.projector.zengram" })
@@ -174,7 +174,7 @@ export default [
       ],
     )
 
-    // Passive extraction: when an assistant turn completes, scan for durable facts.
+    // Passive extraction + decay: when an assistant turn completes.
     // Fire-and-forget — never blocks the main event path.
     if (role === "assistant" && finishReason) {
       extractAndLearn({
@@ -182,6 +182,9 @@ export default [
         sessionId: info.sessionID,
         turnId: info.id,
       }).catch((err) => log.warn("passive extraction failed", { err }))
+
+      decayKnowledge({ projectId: Instance.project.id })
+        .catch((err) => log.warn("knowledge decay failed", { err }))
     }
   }),
 
