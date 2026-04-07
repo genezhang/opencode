@@ -115,6 +115,7 @@
     "@standard-schema/spec": "1.0.0",
     "@types/pg": "8.20.0",
     "@zengram/sdk": "file:/home/gene/zengram/sdk/typescript",
+    "zeta-db": "file:/home/gene/zeta-embedded/bindings/node",
     "@zip.js/zip.js": "2.7.62",
     "ai": "catalog:",
     "ai-gateway-provider": "3.1.2",

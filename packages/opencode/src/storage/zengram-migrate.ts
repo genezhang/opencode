@@ -14,6 +14,7 @@
 import pg from "pg"
 import crypto from "crypto"
 import { Log } from "@/util/log"
+import type { Database } from "zeta-db"
 
 const log = Log.create({ service: "zengram-migrate" })
 
@@ -643,4 +644,80 @@ export async function runMigrations(pool: pg.Pool): Promise<number> {
   } finally {
     client.release()
   }
+}
+
+/**
+ * Apply all pending Zengram schema migrations using the embedded NAPI driver.
+ *
+ * Mirrors runMigrations() but uses db.runScript() for multi-statement DDL
+ * (maps to zeta_exec_batch which handles semicolon-delimited statements) and
+ * a plain execute() for the tracking record insert. No pg.Pool required.
+ *
+ * Atomicity note: DDL in Zeta auto-commits per statement. If the process dies
+ * between runScript() and the tracking insert, the next run detects the missing
+ * tracking row and re-runs the migration — Zeta's CREATE TABLE IF NOT EXISTS
+ * and CREATE INDEX IF NOT EXISTS make re-running safe.
+ *
+ * Returns the number of migrations applied in this call (0 = already up to date).
+ */
+export function runEmbeddedMigrations(db: Database): number {
+  // Create tracking table (single-statement DDL — execute() routes to zeta_exec).
+  db.execute(
+    `CREATE TABLE IF NOT EXISTS _zengram_migrations (
+      version     INTEGER PRIMARY KEY,
+      name        TEXT NOT NULL,
+      checksum    TEXT NOT NULL,
+      applied_at  BIGINT NOT NULL
+    )`,
+  )
+
+  const appliedRows = db.query(
+    "SELECT version, checksum FROM _zengram_migrations ORDER BY version",
+  ) as Array<{ version: number; checksum: string }>
+
+  const applied = new Map<number, string>(
+    appliedRows.map((r) => [Number(r.version), String(r.checksum)]),
+  )
+
+  let count = 0
+
+  for (const m of MIGRATIONS) {
+    const cs = checksum(m.sql)
+    const label = versionLabel(m.version, m.name)
+    const existingCs = applied.get(m.version)
+
+    if (existingCs !== undefined) {
+      if (existingCs !== cs) {
+        throw new Error(`Checksum mismatch for ${label}: stored=${existingCs} computed=${cs}`)
+      }
+      continue // already applied
+    }
+
+    log.info("applying migration (embedded)", { label })
+    process.stderr.write(`[opencode] Applying migration ${label}...\n`)
+
+    try {
+      // Multi-statement DDL: runScript() → zeta_exec_batch handles semicolons.
+      db.runScript(m.sql)
+      // Record that this migration was applied.
+      const now = Date.now() * 1000
+      db.execute(
+        `INSERT INTO _zengram_migrations (version, name, checksum, applied_at)` +
+          ` VALUES (${m.version}, '${m.name}', '${cs}', ${now})`,
+      )
+      count++
+      log.info("migration applied (embedded)", { label })
+    } catch (e) {
+      throw new Error(`Failed to apply ${label}: ${e}`)
+    }
+  }
+
+  if (count === 0) {
+    log.info("migrations: schema is up to date (embedded)")
+  } else {
+    log.info("migrations applied (embedded)", { count })
+    process.stderr.write(`[opencode] Applied ${count} migration(s).\n`)
+  }
+
+  return count
 }
