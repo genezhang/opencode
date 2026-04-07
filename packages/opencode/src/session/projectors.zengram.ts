@@ -18,6 +18,7 @@ import { zengramDb } from "@/storage/db.zengram"
 import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
 import { extractAndLearn, decayKnowledge } from "@/knowledge"
+import { coding } from "@zengram/sdk"
 import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "session.projector.zengram" })
@@ -251,6 +252,42 @@ export default [
           toolState === "completed" || toolState === "error" ? now : null,
         ],
       )
+
+      // Record file operations for completed file-modifying tool calls.
+      if (toolState === "completed") {
+        const toolName: string = toolData.toolName ?? ""
+        const input = toolData.input as Record<string, unknown> ?? {}
+
+        // Map tool name → operation type and file path field.
+        const FILE_TOOLS: Record<string, { op: coding.FileOperation["operation"]; field: string }> = {
+          write: { op: "write", field: "filePath" },
+          edit: { op: "write", field: "filePath" },
+          multiedit: { op: "write", field: "filePath" },
+          read: { op: "read", field: "filePath" },
+          list: { op: "list", field: "path" },
+        }
+        const mapping = FILE_TOOLS[toolName]
+        if (mapping) {
+          const filePath = input[mapping.field]
+          if (typeof filePath === "string" && filePath) {
+            coding.recordFileOperation(db, {
+              toolCallId: id,
+              sessionId: sessionID,
+              filePath,
+              operation: mapping.op,
+            }).catch((e: unknown) => log.warn("file_operation record failed", { err: e }))
+
+            coding.upsertWorkspaceFile(db, {
+              sessionId: sessionID,
+              filePath,
+              understanding: mapping.op === "write" ? "deep" : mapping.op === "read" ? "read" : "listed",
+              editState: mapping.op === "write" ? "modified" : undefined,
+              ...(mapping.op === "write" ? { lastWriteTurn: messageID } : {}),
+              ...(mapping.op === "read" ? { lastReadTurn: messageID } : {}),
+            }).catch((e: unknown) => log.warn("workspace_file upsert failed", { err: e }))
+          }
+        }
+      }
     }
   }),
 

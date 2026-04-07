@@ -37,6 +37,7 @@ import { errorMessage } from "./util/error"
 import { ZENGRAM_ENABLED, initZengram, zengramPool, PGWIRE_MODE } from "./storage/db.zengram"
 import { initEmbedded, rawEmbeddedDb } from "./storage/db.embedded"
 import { backfillEmbeddings } from "./knowledge"
+import { registerLlmAdapter } from "./knowledge/adapter"
 import { ensureZeta } from "./storage/zeta-process"
 import { runMigrations, runEmbeddedMigrations } from "./storage/zengram-migrate"
 import { PluginCommand } from "./cli/cmd/plug"
@@ -127,6 +128,9 @@ const cli = yargs(args)
         initEmbedded(ZETA_DATA_DIR, "lsm")
         runEmbeddedMigrations(rawEmbeddedDb())
       }
+
+      // Register OpenCode's AI provider as the Zengram LLM adapter (extraction + reflection).
+      registerLlmAdapter()
 
       // Backfill embeddings for knowledge entries that predate embed() support.
       // Fire-and-forget: embed() may not be available without libzeta_embed.a.
