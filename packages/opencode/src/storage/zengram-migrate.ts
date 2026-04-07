@@ -1,17 +1,28 @@
 /**
- * Zengram migration runner for the TypeScript / OpenCode integration.
+ * TypeScript migration runner for the Zengram schema.
  *
- * Mirrors the Rust zengram-schema runner: checksums, tracking table, idempotent.
- * Uses pg Simple Query Protocol (no params) for DDL so Zeta's Extended Query
- * Protocol quirks (no RowDescription on some DDL) don't apply.
+ * Mirrors the Rust zengram-schema runner: applies versioned SQL migrations in
+ * order, tracks applied migrations in `_zengram_migrations`, and verifies
+ * checksums so schema drift is caught immediately.
+ *
+ * Uses the pg Simple Query Protocol for DDL (no params) so multi-statement
+ * migration files are sent as a single query and execute within one round-trip.
+ * Each migration is wrapped in a transaction so partial failures roll back
+ * cleanly.
  */
 
-import crypto from "crypto"
 import pg from "pg"
+import crypto from "crypto"
+import { Log } from "@/util/log"
+
+const log = Log.create({ service: "zengram-migrate" })
 
 // ── Embedded migration SQL ────────────────────────────────────────────────────
+// Inlined from zengram-schema/src/migrations/ so this module is self-contained
+// in the compiled Bun binary with no external file references.
 
-const V001 = `-- Layer 0: Storage Primitives
+const V001 = `
+-- Layer 0: Storage Primitives
 CREATE TABLE event_log (
     lsn             BIGSERIAL PRIMARY KEY,
     session_id      TEXT NOT NULL,
@@ -35,9 +46,11 @@ CREATE TABLE embedding (
     dimensions      INTEGER NOT NULL,
     time_created    BIGINT NOT NULL
 );
-CREATE INDEX embedding_source_idx ON embedding(source_type, source_id);`
+CREATE INDEX embedding_source_idx ON embedding(source_type, source_id);
+`
 
-const V002 = `-- Layer 1: Core Agent State
+const V002 = `
+-- Layer 1: Core Agent State
 CREATE TABLE project (
     id              TEXT PRIMARY KEY,
     name            TEXT,
@@ -242,9 +255,11 @@ CREATE TABLE subagent_run (
     time_completed  BIGINT,
     runtime_ms      BIGINT DEFAULT 0
 );
-CREATE INDEX subagent_run_parent_idx ON subagent_run(parent_session, status);`
+CREATE INDEX subagent_run_parent_idx ON subagent_run(parent_session, status);
+`
 
-const V003 = `-- Layer 2: Intelligence Layer
+const V003 = `
+-- Layer 2: Intelligence Layer
 CREATE TABLE knowledge (
     id              TEXT PRIMARY KEY,
     project_id      TEXT REFERENCES project(id),
@@ -323,9 +338,11 @@ CREATE TABLE demotion_config (
     min_tokens_freed INTEGER DEFAULT 20000,
     warm_ttl_days   INTEGER DEFAULT 90,
     cold_ttl_days   INTEGER DEFAULT 365
-);`
+);
+`
 
-const V004 = `-- Property graph definition for SQL/PGQ graph queries.
+const V004 = `
+-- Property graph definition for SQL/PGQ graph queries.
 CREATE PROPERTY GRAPH agent_graph
   VERTEX TABLES (
     session
@@ -370,9 +387,11 @@ CREATE PROPERTY GRAPH agent_graph
       DESTINATION KEY (child_session) REFERENCES session (id)
       LABEL SPAWNED
       PROPERTIES (agent_type, status, runtime_ms)
-  );`
+  );
+`
 
-const V005 = `-- Cross-cutting: State portability.
+const V005 = `
+-- Cross-cutting: State portability.
 CREATE TABLE state_snapshot (
     id              TEXT PRIMARY KEY,
     project_id      TEXT REFERENCES project(id),
@@ -385,9 +404,11 @@ CREATE TABLE state_snapshot (
     checksum        TEXT,
     status          TEXT DEFAULT 'active',
     time_created    BIGINT NOT NULL
-);`
+);
+`
 
-const V006 = `-- Layer 3a: Coding agent extension
+const V006 = `
+-- Layer 3a: Coding agent extension
 CREATE TABLE IF NOT EXISTS file_operation (
     id              TEXT PRIMARY KEY,
     tool_call_id    TEXT NOT NULL REFERENCES tool_call(id),
@@ -401,10 +422,8 @@ CREATE TABLE IF NOT EXISTS file_operation (
     depth           TEXT DEFAULT 'listed',
     time_created    BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS file_op_path_idx
-    ON file_operation(file_path, session_id, time_created DESC);
-CREATE INDEX IF NOT EXISTS file_op_session_idx
-    ON file_operation(session_id, time_created DESC);
+CREATE INDEX IF NOT EXISTS file_op_path_idx ON file_operation(file_path, session_id, time_created DESC);
+CREATE INDEX IF NOT EXISTS file_op_session_idx ON file_operation(session_id, time_created DESC);
 CREATE TABLE IF NOT EXISTS workspace_file (
     session_id      TEXT NOT NULL,
     file_path       TEXT NOT NULL,
@@ -419,8 +438,7 @@ CREATE TABLE IF NOT EXISTS workspace_file (
     time_updated    BIGINT NOT NULL,
     PRIMARY KEY (session_id, file_path)
 );
-CREATE INDEX IF NOT EXISTS workspace_file_session_idx
-    ON workspace_file(session_id, relevance DESC);
+CREATE INDEX IF NOT EXISTS workspace_file_session_idx ON workspace_file(session_id, relevance DESC);
 CREATE TABLE IF NOT EXISTS snapshot (
     id              TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL,
@@ -432,8 +450,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
     files_changed   INTEGER DEFAULT 0,
     time_created    BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS snapshot_session_idx
-    ON snapshot(session_id, time_created DESC);
+CREATE INDEX IF NOT EXISTS snapshot_session_idx ON snapshot(session_id, time_created DESC);
 CREATE TABLE IF NOT EXISTS environment (
     id              TEXT PRIMARY KEY,
     session_id      TEXT REFERENCES session(id),
@@ -448,12 +465,12 @@ CREATE TABLE IF NOT EXISTS environment (
     time_created    BIGINT NOT NULL,
     time_updated    BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS environment_session_idx
-    ON environment(session_id, status);
-CREATE INDEX IF NOT EXISTS environment_project_idx
-    ON environment(project_id, status);`
+CREATE INDEX IF NOT EXISTS environment_session_idx ON environment(session_id, status);
+CREATE INDEX IF NOT EXISTS environment_project_idx ON environment(project_id, status);
+`
 
-const V007 = `-- V007: OpenCode compatibility extensions.
+const V007 = `
+-- V007: OpenCode compatibility extensions.
 CREATE TABLE IF NOT EXISTS workspace (
     id              TEXT PRIMARY KEY,
     project_id      TEXT NOT NULL REFERENCES project(id),
@@ -507,111 +524,119 @@ ALTER TABLE session ADD COLUMN summary_diffs     JSONB;
 ALTER TABLE session ADD COLUMN revert_state      JSONB;
 ALTER TABLE session ADD COLUMN permission_json   JSONB;
 ALTER TABLE session ADD COLUMN time_compacting   BIGINT;
-CREATE INDEX IF NOT EXISTS session_workspace_idx ON session(workspace_id);`
+CREATE INDEX IF NOT EXISTS session_workspace_idx ON session(workspace_id);
+`
 
-const V008 = `-- V008: Extend turn table with OpenCode model/provider tracking.
+const V008 = `
+-- V008: Turn model/provider tracking.
 ALTER TABLE turn ADD COLUMN IF NOT EXISTS model_id    TEXT;
-ALTER TABLE turn ADD COLUMN IF NOT EXISTS provider_id TEXT;`
+ALTER TABLE turn ADD COLUMN IF NOT EXISTS provider_id TEXT;
+`
 
-const V009 = `-- V009: Add vector embedding column to knowledge table + HNSW index.
+const V009 = `
+-- V009: Knowledge vector embedding column + HNSW index.
 ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS embedding VECTOR(384);
 CREATE INDEX IF NOT EXISTS knowledge_embedding_idx
   ON knowledge USING hnsw (embedding)
-  WITH (m = 16, ef_construction = 64);`
+  WITH (m = 16, ef_construction = 64);
+`
 
 // ── Migration registry ────────────────────────────────────────────────────────
 
-interface Migration {
-  version: number
-  name: string
-  sql: string
-  /** If true, failures are logged as warnings and the migration is still recorded as applied. */
-  optional?: boolean
-}
-
-const MIGRATIONS: Migration[] = [
+const MIGRATIONS = [
   { version: 1, name: "layer0_storage",       sql: V001 },
-  { version: 2, name: "layer1_core",          sql: V002 },
-  { version: 3, name: "layer2_intelligence",  sql: V003 },
-  // CREATE PROPERTY GRAPH has a catalog-visibility bug in some Zeta builds;
-  // mark optional so it doesn't block startup.
-  { version: 4, name: "property_graph",       sql: V004, optional: true },
-  { version: 5, name: "cross_cutting",        sql: V005 },
-  { version: 6, name: "layer3_coding",        sql: V006 },
-  { version: 7, name: "opencode_extensions",  sql: V007 },
-  { version: 8, name: "turn_opencode_fields", sql: V008 },
-  { version: 9, name: "knowledge_vector",     sql: V009 },
+  { version: 2, name: "layer1_core",           sql: V002 },
+  { version: 3, name: "layer2_intelligence",   sql: V003 },
+  { version: 4, name: "property_graph",        sql: V004 },
+  { version: 5, name: "cross_cutting",         sql: V005 },
+  { version: 6, name: "layer3_coding",         sql: V006 },
+  { version: 7, name: "opencode_extensions",   sql: V007 },
+  { version: 8, name: "turn_opencode_fields",  sql: V008 },
+  { version: 9, name: "knowledge_vector",      sql: V009 },
 ]
 
 function checksum(sql: string): string {
   return crypto.createHash("sha256").update(sql, "utf8").digest("hex")
 }
 
+function versionLabel(version: number, name: string): string {
+  return `V${String(version).padStart(3, "0")}__${name}`
+}
+
 // ── Runner ────────────────────────────────────────────────────────────────────
 
 /**
- * Apply any pending Zengram migrations to the given pool's database.
+ * Apply all pending Zengram schema migrations.
  *
- * - Uses Simple Query Protocol (no params) for all DDL so Zeta quirks don't apply.
- * - Each migration runs in an explicit BEGIN/COMMIT transaction.
- * - Returns the number of migrations applied.
+ * Creates the `_zengram_migrations` tracking table if absent, then applies
+ * each unapplied migration inside its own transaction. Fails fast on the
+ * first error. Verifies checksums of already-applied migrations so schema
+ * drift is detected immediately.
+ *
+ * Returns the number of migrations applied in this call (0 = already up to date).
  */
 export async function runMigrations(pool: pg.Pool): Promise<number> {
   const client = await pool.connect()
   try {
-    // Create tracking table via simple query (no params → simple protocol)
-    await client.query(
-      `CREATE TABLE IF NOT EXISTS _zengram_migrations (
-        version    INTEGER PRIMARY KEY,
-        name       TEXT NOT NULL,
-        checksum   TEXT NOT NULL,
-        applied_at BIGINT NOT NULL
-      )`,
-    )
+    // Create tracking table via simple query (no params needed).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS _zengram_migrations (
+        version     INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,
+        checksum    TEXT NOT NULL,
+        applied_at  BIGINT NOT NULL
+      )
+    `)
 
-    // Load applied versions — Zeta returns INTEGER columns as strings
     const result = await client.query(
       "SELECT version, checksum FROM _zengram_migrations ORDER BY version",
     )
     const applied = new Map<number, string>(
-      result.rows.map((r) => [Number(r.version), r.checksum as string]),
+      result.rows.map((r) => [r.version as number, r.checksum as string]),
     )
 
     let count = 0
+
     for (const m of MIGRATIONS) {
-      if (applied.has(m.version)) continue
-
       const cs = checksum(m.sql)
-      const now = Date.now()
+      const label = versionLabel(m.version, m.name)
+      const existingCs = applied.get(m.version)
 
-      await client.query("BEGIN")
-      try {
-        // Run migration SQL via simple protocol (multi-statement DDL allowed)
-        await client.query(m.sql)
-      } catch (err) {
-        await client.query("ROLLBACK").catch(() => {})
-        if (m.optional) {
-          // Log warning but record as applied so we don't retry on every startup
-          process.stderr.write(
-            `[zengram] warning: optional migration ${m.version} (${m.name}) failed: ` +
-            `${(err as Error).message}\n`,
-          )
-          await client.query(
-            `INSERT INTO _zengram_migrations (version, name, checksum, applied_at)` +
-            ` VALUES (${m.version}, '${m.name}', '${cs}', ${now})`,
-          )
-          count++
-          continue
+      if (existingCs !== undefined) {
+        if (existingCs !== cs) {
+          throw new Error(`Checksum mismatch for ${label}: stored=${existingCs} computed=${cs}`)
         }
-        throw err
+        continue // already applied
       }
-      // Inline values: name/checksum are developer constants (no injection risk)
-      await client.query(
-        `INSERT INTO _zengram_migrations (version, name, checksum, applied_at)` +
-        ` VALUES (${m.version}, '${m.name}', '${cs}', ${now})`,
-      )
-      await client.query("COMMIT")
-      count++
+
+      log.info("applying migration", { label })
+      process.stderr.write(`[opencode] Applying migration ${label}...\n`)
+
+      try {
+        // DDL + tracking record in a single transaction.
+        // Simple query protocol handles multi-statement SQL in m.sql.
+        await client.query("BEGIN")
+        await client.query(m.sql)
+        // Inline values — all are safe constants, no injection risk.
+        const now = Date.now() * 1000
+        await client.query(
+          `INSERT INTO _zengram_migrations (version, name, checksum, applied_at)` +
+            ` VALUES (${m.version}, '${m.name}', '${cs}', ${now})`,
+        )
+        await client.query("COMMIT")
+        count++
+        log.info("migration applied", { label })
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {})
+        throw new Error(`Failed to apply ${label}: ${e}`)
+      }
+    }
+
+    if (count === 0) {
+      log.info("migrations: schema is up to date")
+    } else {
+      log.info("migrations applied", { count })
+      process.stderr.write(`[opencode] Applied ${count} migration(s).\n`)
     }
 
     return count

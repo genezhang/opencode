@@ -4,6 +4,7 @@ import { Effect, Layer, Option, Schema, ServiceMap } from "effect"
 import { Database } from "@/storage/db"
 import { AccountStateTable, AccountTable } from "./account.sql"
 import { AccessToken, AccountID, AccountRepoError, Info, OrgID, RefreshToken } from "./schema"
+import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
 
 export type AccountRow = (typeof AccountTable)["$inferSelect"]
 
@@ -75,42 +76,133 @@ export class AccountRepo extends ServiceMap.Service<AccountRepo, AccountRepo.Ser
           .run()
       }
 
-      const active = Effect.fn("AccountRepo.active")(() =>
-        query((db) => current(db)).pipe(Effect.map((row) => (row ? Option.some(decode(row)) : Option.none()))),
-      )
+      const active = Effect.fn("AccountRepo.active")(() => {
+        if (ZENGRAM_ENABLED) {
+          return Effect.promise(async () => {
+            const zdb = zengramDb()
+            const stateRows = await zdb.query<{ active_account_id: string | null; active_org_id: string | null }>(
+              `SELECT active_account_id, active_org_id FROM account_state WHERE id = $1`,
+              [ACCOUNT_STATE_ID],
+            )
+            const activeId = stateRows[0]?.active_account_id
+            if (!activeId) return Option.none<Info>()
+            const accRows = await zdb.query<{
+              id: string; email: string; url: string
+              access_token: string; refresh_token: string; token_expiry: number | null
+            }>(
+              `SELECT id, email, url, access_token, refresh_token, token_expiry FROM account WHERE id = $1`,
+              [activeId],
+            )
+            if (!accRows[0]) return Option.none<Info>()
+            const row = accRows[0]
+            return Option.some(
+              decode({ ...row, active_org_id: stateRows[0]?.active_org_id ?? null }),
+            )
+          })
+        }
+        return query((db) => current(db)).pipe(Effect.map((row) => (row ? Option.some(decode(row)) : Option.none())))
+      })
 
-      const list = Effect.fn("AccountRepo.list")(() =>
-        query((db) =>
+      const list = Effect.fn("AccountRepo.list")(() => {
+        if (ZENGRAM_ENABLED) {
+          return Effect.promise(async () => {
+            const rows = await zengramDb().query<{
+              id: string; email: string; url: string
+              access_token: string; refresh_token: string; token_expiry: number | null
+            }>(
+              `SELECT id, email, url, access_token, refresh_token, token_expiry FROM account`,
+              [],
+            )
+            return rows.map((row) => decode({ ...row, active_org_id: null }))
+          })
+        }
+        return query((db) =>
           db
             .select()
             .from(AccountTable)
             .all()
             .map((row: AccountRow) => decode({ ...row, active_org_id: null })),
-        ),
-      )
+        )
+      })
 
-      const remove = Effect.fn("AccountRepo.remove")((accountID: AccountID) =>
-        tx((db) => {
+      const remove = Effect.fn("AccountRepo.remove")((accountID: AccountID) => {
+        if (ZENGRAM_ENABLED) {
+          return Effect.promise(async () => {
+            const zdb = zengramDb()
+            await zdb.execute(
+              `UPDATE account_state SET active_account_id = NULL, active_org_id = NULL WHERE active_account_id = $1`,
+              [accountID],
+            )
+            await zdb.execute(`DELETE FROM account WHERE id = $1`, [accountID])
+          })
+        }
+        return tx((db) => {
           db.update(AccountStateTable)
             .set({ active_account_id: null, active_org_id: null })
             .where(eq(AccountStateTable.active_account_id, accountID))
             .run()
           db.delete(AccountTable).where(eq(AccountTable.id, accountID)).run()
-        }).pipe(Effect.asVoid),
-      )
+        }).pipe(Effect.asVoid)
+      })
 
-      const use = Effect.fn("AccountRepo.use")((accountID: AccountID, orgID: Option.Option<OrgID>) =>
-        query((db) => state(db, accountID, orgID)).pipe(Effect.asVoid),
-      )
+      const use = Effect.fn("AccountRepo.use")((accountID: AccountID, orgID: Option.Option<OrgID>) => {
+        if (ZENGRAM_ENABLED) {
+          const orgId = Option.getOrNull(orgID)
+          return Effect.promise(() =>
+            zengramDb().execute(
+              `INSERT INTO account_state (id, active_account_id, active_org_id) VALUES ($1,$2,$3)
+               ON CONFLICT (id) DO UPDATE SET active_account_id = EXCLUDED.active_account_id, active_org_id = EXCLUDED.active_org_id`,
+              [ACCOUNT_STATE_ID, accountID, orgId],
+            ),
+          )
+        }
+        return query((db) => state(db, accountID, orgID)).pipe(Effect.asVoid)
+      })
 
-      const getRow = Effect.fn("AccountRepo.getRow")((accountID: AccountID) =>
-        query((db) => db.select().from(AccountTable).where(eq(AccountTable.id, accountID)).get()).pipe(
+      const getRow = Effect.fn("AccountRepo.getRow")((accountID: AccountID) => {
+        if (ZENGRAM_ENABLED) {
+          return Effect.promise(async () => {
+            const rows = await zengramDb().query<{
+              id: string; email: string; url: string
+              access_token: string; refresh_token: string; token_expiry: number | null
+            }>(
+              `SELECT id, email, url, access_token, refresh_token, token_expiry FROM account WHERE id = $1`,
+              [accountID],
+            )
+            if (!rows[0]) return Option.none<AccountRow>()
+            const r = rows[0]
+            // Construct an AccountRow-compatible object (time_created/updated not used by callers)
+            const row: AccountRow = {
+              id: r.id as AccountID,
+              email: r.email,
+              url: r.url,
+              access_token: r.access_token as AccessToken,
+              refresh_token: r.refresh_token as RefreshToken,
+              token_expiry: r.token_expiry,
+              time_created: 0,
+              time_updated: 0,
+            }
+            return Option.some(row)
+          })
+        }
+        return query((db) => db.select().from(AccountTable).where(eq(AccountTable.id, accountID)).get()).pipe(
           Effect.map(Option.fromNullishOr),
-        ),
-      )
+        )
+      })
 
-      const persistToken = Effect.fn("AccountRepo.persistToken")((input) =>
-        query((db) =>
+      const persistToken = Effect.fn("AccountRepo.persistToken")((input) => {
+        if (ZENGRAM_ENABLED) {
+          return Effect.promise(() =>
+            zengramDb().execute(
+              `UPDATE account SET access_token=$1, refresh_token=$2, token_expiry=$3 WHERE id=$4`,
+              [
+                input.accessToken, input.refreshToken,
+                Option.getOrNull(input.expiry), input.accountID,
+              ],
+            ),
+          )
+        }
+        return query((db) =>
           db
             .update(AccountTable)
             .set({
@@ -120,11 +212,32 @@ export class AccountRepo extends ServiceMap.Service<AccountRepo, AccountRepo.Ser
             })
             .where(eq(AccountTable.id, input.accountID))
             .run(),
-        ).pipe(Effect.asVoid),
-      )
+        ).pipe(Effect.asVoid)
+      })
 
-      const persistAccount = Effect.fn("AccountRepo.persistAccount")((input) =>
-        tx((db) => {
+      const persistAccount = Effect.fn("AccountRepo.persistAccount")((input) => {
+        if (ZENGRAM_ENABLED) {
+          const orgId = Option.getOrNull(input.orgID)
+          return Effect.promise(async () => {
+            const zdb = zengramDb()
+            const now = Date.now() * 1000
+            await zdb.execute(
+              `INSERT INTO account (id, email, url, access_token, refresh_token, token_expiry, time_created, time_updated)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               ON CONFLICT (id) DO UPDATE SET
+                 email = EXCLUDED.email, url = EXCLUDED.url,
+                 access_token = EXCLUDED.access_token, refresh_token = EXCLUDED.refresh_token,
+                 token_expiry = EXCLUDED.token_expiry, time_updated = EXCLUDED.time_updated`,
+              [input.id, input.email, input.url, input.accessToken, input.refreshToken, input.expiry, now, now],
+            )
+            await zdb.execute(
+              `INSERT INTO account_state (id, active_account_id, active_org_id) VALUES ($1,$2,$3)
+               ON CONFLICT (id) DO UPDATE SET active_account_id = EXCLUDED.active_account_id, active_org_id = EXCLUDED.active_org_id`,
+              [ACCOUNT_STATE_ID, input.id, orgId],
+            )
+          })
+        }
+        return tx((db) => {
           db.insert(AccountTable)
             .values({
               id: input.id,
@@ -146,8 +259,8 @@ export class AccountRepo extends ServiceMap.Service<AccountRepo, AccountRepo.Ser
             })
             .run()
           void state(db, input.id, input.orgID)
-        }).pipe(Effect.asVoid),
-      )
+        }).pipe(Effect.asVoid)
+      })
 
       return AccountRepo.of({
         active,

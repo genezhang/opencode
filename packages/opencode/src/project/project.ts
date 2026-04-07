@@ -14,6 +14,7 @@ import { NodeFileSystem, NodePath } from "@effect/platform-node"
 import { makeRuntime } from "@/effect/run-service"
 import { AppFileSystem } from "@/filesystem"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
+import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
 
 export namespace Project {
   const log = Log.create({ service: "project" })
@@ -53,6 +54,41 @@ export namespace Project {
   }
 
   type Row = typeof ProjectTable.$inferSelect
+
+  type ZengramProjectRow = {
+    id: string
+    name: string | null
+    worktree: string
+    vcs: string | null
+    icon_url: string | null
+    icon_color: string | null
+    sandboxes: string[] | null
+    commands: { start?: string } | null
+    time_created: number | string
+    time_updated: number | string
+    time_initialized: number | string | null
+  }
+
+  function zengramRowToProjectInfo(row: ZengramProjectRow): Info {
+    const icon =
+      row.icon_url || row.icon_color
+        ? { url: row.icon_url ?? undefined, color: row.icon_color ?? undefined }
+        : undefined
+    return {
+      id: row.id as ProjectID,
+      worktree: row.worktree,
+      vcs: row.vcs ? Info.shape.vcs.parse(row.vcs) : undefined,
+      name: row.name ?? undefined,
+      icon,
+      time: {
+        created: Number(row.time_created),
+        updated: Number(row.time_updated),
+        initialized: row.time_initialized != null ? Number(row.time_initialized) : undefined,
+      },
+      sandboxes: row.sandboxes ?? [],
+      commands: row.commands ?? undefined,
+    }
+  }
 
   export function fromRow(row: Row): Info {
     const icon =
@@ -245,16 +281,36 @@ export namespace Project {
         })
 
         // Phase 2: upsert
-        const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, data.id)).get())
-        const existing = row
-          ? fromRow(row)
-          : {
+        let existing: Info
+        if (ZENGRAM_ENABLED) {
+          existing = yield* Effect.promise(async () => {
+            const rows = await zengramDb().query<ZengramProjectRow>(
+              `SELECT id, name, worktree, vcs, icon_url, icon_color, sandboxes, commands,
+                      time_created, time_updated, time_initialized
+               FROM project WHERE id = $1`,
+              [data.id],
+            )
+            if (rows[0]) return zengramRowToProjectInfo(rows[0])
+            return {
               id: data.id,
               worktree: data.worktree,
               vcs: data.vcs,
               sandboxes: [] as string[],
               time: { created: Date.now(), updated: Date.now() },
-            }
+            } as Info
+          })
+        } else {
+          const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, data.id)).get())
+          existing = row
+            ? fromRow(row)
+            : {
+                id: data.id,
+                worktree: data.worktree,
+                vcs: data.vcs,
+                sandboxes: [] as string[],
+                time: { created: Date.now(), updated: Date.now() },
+              }
+        }
 
         if (Flag.OPENCODE_EXPERIMENTAL_ICON_DISCOVERY)
           yield* discover(existing).pipe(Effect.ignore, Effect.forkIn(scope))
@@ -277,47 +333,78 @@ export namespace Project {
           { concurrency: "unbounded" },
         ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
-        yield* db((d) =>
-          d
-            .insert(ProjectTable)
-            .values({
-              id: result.id,
-              worktree: result.worktree,
-              vcs: result.vcs ?? null,
-              name: result.name,
-              icon_url: result.icon?.url,
-              icon_color: result.icon?.color,
-              time_created: result.time.created,
-              time_updated: result.time.updated,
-              time_initialized: result.time.initialized,
-              sandboxes: result.sandboxes,
-              commands: result.commands,
-            })
-            .onConflictDoUpdate({
-              target: ProjectTable.id,
-              set: {
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(async () => {
+            const zdb = zengramDb()
+            await zdb.execute(
+              `INSERT INTO project (id, name, root_path, worktree, vcs, icon_url, icon_color,
+                      sandboxes, commands, time_created, time_updated, time_initialized)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               ON CONFLICT (id) DO UPDATE SET
+                 name = EXCLUDED.name, root_path = EXCLUDED.root_path,
+                 worktree = EXCLUDED.worktree, vcs = EXCLUDED.vcs,
+                 icon_url = EXCLUDED.icon_url, icon_color = EXCLUDED.icon_color,
+                 time_updated = EXCLUDED.time_updated,
+                 time_initialized = EXCLUDED.time_initialized,
+                 sandboxes = EXCLUDED.sandboxes, commands = EXCLUDED.commands`,
+              [
+                result.id, result.name ?? null, result.worktree, result.worktree,
+                result.vcs ?? null, result.icon?.url ?? null, result.icon?.color ?? null,
+                JSON.stringify(result.sandboxes),
+                result.commands ? JSON.stringify(result.commands) : null,
+                result.time.created, result.time.updated, result.time.initialized ?? null,
+              ],
+            )
+            if (data.id !== ProjectID.global) {
+              await zdb.execute(
+                `UPDATE session SET project_id = $1 WHERE project_id = $2 AND directory = $3`,
+                [data.id, ProjectID.global, data.worktree],
+              )
+            }
+          })
+        } else {
+          yield* db((d) =>
+            d
+              .insert(ProjectTable)
+              .values({
+                id: result.id,
                 worktree: result.worktree,
                 vcs: result.vcs ?? null,
                 name: result.name,
                 icon_url: result.icon?.url,
                 icon_color: result.icon?.color,
+                time_created: result.time.created,
                 time_updated: result.time.updated,
                 time_initialized: result.time.initialized,
                 sandboxes: result.sandboxes,
                 commands: result.commands,
-              },
-            })
-            .run(),
-        )
-
-        if (data.id !== ProjectID.global) {
-          yield* db((d) =>
-            d
-              .update(SessionTable)
-              .set({ project_id: data.id })
-              .where(and(eq(SessionTable.project_id, ProjectID.global), eq(SessionTable.directory, data.worktree)))
+              })
+              .onConflictDoUpdate({
+                target: ProjectTable.id,
+                set: {
+                  worktree: result.worktree,
+                  vcs: result.vcs ?? null,
+                  name: result.name,
+                  icon_url: result.icon?.url,
+                  icon_color: result.icon?.color,
+                  time_updated: result.time.updated,
+                  time_initialized: result.time.initialized,
+                  sandboxes: result.sandboxes,
+                  commands: result.commands,
+                },
+              })
               .run(),
           )
+
+          if (data.id !== ProjectID.global) {
+            yield* db((d) =>
+              d
+                .update(SessionTable)
+                .set({ project_id: data.id })
+                .where(and(eq(SessionTable.project_id, ProjectID.global), eq(SessionTable.directory, data.worktree)))
+                .run(),
+            )
+          }
         }
 
         yield* emitUpdated(result)
@@ -346,16 +433,48 @@ export namespace Project {
         yield* update({ projectID: input.id, icon: { url } })
       })
 
+      const PROJECT_SELECT = `SELECT id, name, worktree, vcs, icon_url, icon_color, sandboxes, commands,
+              time_created, time_updated, time_initialized FROM project`
+
       const list = Effect.fn("Project.list")(function* () {
+        if (ZENGRAM_ENABLED) {
+          const rows = yield* Effect.promise(() => zengramDb().query<ZengramProjectRow>(PROJECT_SELECT, []))
+          return rows.map(zengramRowToProjectInfo)
+        }
         return yield* db((d) => d.select().from(ProjectTable).all().map(fromRow))
       })
 
       const get = Effect.fn("Project.get")(function* (id: ProjectID) {
+        if (ZENGRAM_ENABLED) {
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<ZengramProjectRow>(`${PROJECT_SELECT} WHERE id = $1`, [id]),
+          )
+          return rows[0] ? zengramRowToProjectInfo(rows[0]) : undefined
+        }
         const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
         return row ? fromRow(row) : undefined
       })
 
       const update = Effect.fn("Project.update")(function* (input: UpdateInput) {
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(() =>
+            zengramDb().execute(
+              `UPDATE project SET name=$1, icon_url=$2, icon_color=$3, commands=$4, time_updated=$5 WHERE id=$6`,
+              [
+                input.name ?? null, input.icon?.url ?? null, input.icon?.color ?? null,
+                input.commands ? JSON.stringify(input.commands) : null,
+                Date.now(), input.projectID,
+              ],
+            ),
+          )
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<ZengramProjectRow>(`${PROJECT_SELECT} WHERE id = $1`, [input.projectID]),
+          )
+          if (!rows[0]) throw new Error(`Project not found: ${input.projectID}`)
+          const data = zengramRowToProjectInfo(rows[0])
+          yield* emitUpdated(data)
+          return data
+        }
         const result = yield* db((d) =>
           d
             .update(ProjectTable)
@@ -388,17 +507,32 @@ export namespace Project {
       })
 
       const setInitialized = Effect.fn("Project.setInitialized")(function* (id: ProjectID) {
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(() =>
+            zengramDb().execute(`UPDATE project SET time_initialized=$1 WHERE id=$2`, [Date.now(), id]),
+          )
+          return
+        }
         yield* db((d) =>
           d.update(ProjectTable).set({ time_initialized: Date.now() }).where(eq(ProjectTable.id, id)).run(),
         )
       })
 
       const sandboxes = Effect.fn("Project.sandboxes")(function* (id: ProjectID) {
-        const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
-        if (!row) return []
-        const data = fromRow(row)
+        let sboxes: string[]
+        if (ZENGRAM_ENABLED) {
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<{ sandboxes: string[] | null }>(`SELECT sandboxes FROM project WHERE id = $1`, [id]),
+          )
+          if (!rows[0]) return []
+          sboxes = rows[0].sandboxes ?? []
+        } else {
+          const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
+          if (!row) return []
+          sboxes = fromRow(row).sandboxes
+        }
         return yield* Effect.forEach(
-          data.sandboxes,
+          sboxes,
           (dir) =>
             fs.isDir(dir).pipe(
               Effect.orDie,
@@ -409,6 +543,27 @@ export namespace Project {
       })
 
       const addSandbox = Effect.fn("Project.addSandbox")(function* (id: ProjectID, directory: string) {
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(async () => {
+            const zdb = zengramDb()
+            const rows = await zdb.query<{ sandboxes: string[] | null }>(
+              `SELECT sandboxes FROM project WHERE id = $1`,
+              [id],
+            )
+            if (!rows[0]) throw new Error(`Project not found: ${id}`)
+            const sboxes = [...(rows[0].sandboxes ?? [])]
+            if (!sboxes.includes(directory)) sboxes.push(directory)
+            await zdb.execute(
+              `UPDATE project SET sandboxes=$1, time_updated=$2 WHERE id=$3`,
+              [JSON.stringify(sboxes), Date.now(), id],
+            )
+          })
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<ZengramProjectRow>(`${PROJECT_SELECT} WHERE id = $1`, [id]),
+          )
+          yield* emitUpdated(zengramRowToProjectInfo(rows[0]!))
+          return
+        }
         const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
         if (!row) throw new Error(`Project not found: ${id}`)
         const sboxes = [...row.sandboxes]
@@ -426,6 +581,26 @@ export namespace Project {
       })
 
       const removeSandbox = Effect.fn("Project.removeSandbox")(function* (id: ProjectID, directory: string) {
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(async () => {
+            const zdb = zengramDb()
+            const rows = await zdb.query<{ sandboxes: string[] | null }>(
+              `SELECT sandboxes FROM project WHERE id = $1`,
+              [id],
+            )
+            if (!rows[0]) throw new Error(`Project not found: ${id}`)
+            const sboxes = (rows[0].sandboxes ?? []).filter((s) => s !== directory)
+            await zdb.execute(
+              `UPDATE project SET sandboxes=$1, time_updated=$2 WHERE id=$3`,
+              [JSON.stringify(sboxes), Date.now(), id],
+            )
+          })
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<ZengramProjectRow>(`${PROJECT_SELECT} WHERE id = $1`, [id]),
+          )
+          yield* emitUpdated(zengramRowToProjectInfo(rows[0]!))
+          return
+        }
         const row = yield* db((d) => d.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
         if (!row) throw new Error(`Project not found: ${id}`)
         const sboxes = row.sandboxes.filter((s) => s !== directory)
@@ -475,7 +650,10 @@ export namespace Project {
     return runPromise((svc) => svc.discover(input))
   }
 
-  export function list() {
+  const _PROJECT_SELECT = `SELECT id, name, worktree, vcs, icon_url, icon_color, sandboxes, commands,
+      time_created, time_updated, time_initialized FROM project`
+
+  export function list(): Info[] {
     return Database.use((db) =>
       db
         .select()
@@ -491,7 +669,11 @@ export namespace Project {
     return fromRow(row)
   }
 
-  export function setInitialized(id: ProjectID) {
+  export async function setInitialized(id: ProjectID): Promise<void> {
+    if (ZENGRAM_ENABLED) {
+      await zengramDb().execute(`UPDATE project SET time_initialized=$1 WHERE id=$2`, [Date.now(), id])
+      return
+    }
     Database.use((db) =>
       db.update(ProjectTable).set({ time_initialized: Date.now() }).where(eq(ProjectTable.id, id)).run(),
     )

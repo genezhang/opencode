@@ -14,6 +14,7 @@ import { Database, eq } from "@/storage/db"
 import { Config } from "@/config/config"
 import { Log } from "@/util/log"
 import { SessionShareTable } from "./share.sql"
+import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
 
 export namespace ShareNext {
   const log = Log.create({ service: "share-next" })
@@ -218,6 +219,16 @@ export namespace ShareNext {
       })
 
       const get = Effect.fnUntraced(function* (sessionID: SessionID) {
+        if (ZENGRAM_ENABLED) {
+          const rows = yield* Effect.promise(() =>
+            zengramDb().query<{ share_id: string; secret: string; url: string }>(
+              `SELECT share_id, secret, url FROM session_share WHERE session_id = $1`,
+              [sessionID],
+            ),
+          )
+          if (!rows[0]) return undefined
+          return { id: rows[0].share_id, secret: rows[0].secret, url: rows[0].url } satisfies Share
+        }
         const row = yield* db((db) =>
           db.select().from(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).get(),
         )
@@ -294,16 +305,29 @@ export namespace ShareNext {
           Effect.flatMap((r) => httpOk.execute(r)),
           Effect.flatMap(HttpClientResponse.schemaBodyJson(ShareSchema)),
         )
-        yield* db((db) =>
-          db
-            .insert(SessionShareTable)
-            .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
-            .onConflictDoUpdate({
-              target: SessionShareTable.session_id,
-              set: { id: result.id, secret: result.secret, url: result.url },
-            })
-            .run(),
-        )
+        if (ZENGRAM_ENABLED) {
+          const now = Date.now() * 1000
+          yield* Effect.promise(() =>
+            zengramDb().execute(
+              `INSERT INTO session_share (session_id, share_id, secret, url, time_created, time_updated)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (session_id) DO UPDATE SET
+                 share_id = EXCLUDED.share_id, secret = EXCLUDED.secret, url = EXCLUDED.url, time_updated = EXCLUDED.time_updated`,
+              [sessionID, result.id, result.secret, result.url, now, now],
+            ),
+          )
+        } else {
+          yield* db((db) =>
+            db
+              .insert(SessionShareTable)
+              .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
+              .onConflictDoUpdate({
+                target: SessionShareTable.session_id,
+                set: { id: result.id, secret: result.secret, url: result.url },
+              })
+              .run(),
+          )
+        }
         const s = yield* InstanceState.get(state)
         yield* full(sessionID).pipe(
           Effect.catchCause((cause) =>
@@ -329,7 +353,11 @@ export namespace ShareNext {
           Effect.flatMap((r) => httpOk.execute(r)),
         )
 
-        yield* db((db) => db.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run())
+        if (ZENGRAM_ENABLED) {
+          yield* Effect.promise(() => zengramDb().execute(`DELETE FROM session_share WHERE session_id = $1`, [sessionID]))
+        } else {
+          yield* db((db) => db.delete(SessionShareTable).where(eq(SessionShareTable.session_id, sessionID)).run())
+        }
       })
 
       return Service.of({ init, url, request, create, remove })

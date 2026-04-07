@@ -166,6 +166,7 @@ async function spawnZeta(bin: string, dataDir: string, port: number): Promise<vo
 
   _proc.stderr?.on("data", (chunk: Buffer) => {
     const line = chunk.toString().trimEnd()
+    // Forward Zeta's own log lines at debug level to avoid noise.
     log.info("zeta", { line })
   })
 

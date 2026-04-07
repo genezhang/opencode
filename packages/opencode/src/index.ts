@@ -34,12 +34,12 @@ import { Global } from "./global"
 import { JsonMigration } from "./storage/json-migration"
 import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
-import { PluginCommand } from "./cli/cmd/plug"
-import { Heap } from "./cli/heap"
 import { ZENGRAM_ENABLED, initZengram, zengramPool } from "./storage/db.zengram"
 import { backfillEmbeddings } from "./knowledge"
 import { ensureZeta } from "./storage/zeta-process"
 import { runMigrations } from "./storage/zengram-migrate"
+import { PluginCommand } from "./cli/cmd/plug"
+import { Heap } from "./cli/heap"
 
 process.on("unhandledRejection", (e) => {
   Log.Default.error("rejection", {
@@ -110,13 +110,19 @@ const cli = yargs(args)
     // Initialise Zengram storage backend if requested.
     if (ZENGRAM_ENABLED) {
       // Start a local Zeta subprocess if no external server is configured.
+      // Returns the port to use, or null if an external server is configured.
       const zetaPort = await ensureZeta()
       if (zetaPort !== null) process.env.ZENGRAM_PORT = String(zetaPort)
+
       await initZengram()
       await runMigrations(zengramPool())
-      // Backfill embeddings fire-and-forget — model files may still be downloading.
+
+      // Backfill embeddings for knowledge entries that predate embed() support.
+      // Fire-and-forget: runs after startup so it doesn't block the first request.
+      // Model files may still be downloading — embed() fails gracefully until ready.
       setTimeout(() => {
-        backfillEmbeddings().catch(() => {})
+        backfillEmbeddings()
+          .catch(() => {/* embed() may not be loaded yet — that's fine */})
       }, 10_000)
     }
 

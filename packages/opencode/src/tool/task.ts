@@ -4,6 +4,7 @@ import z from "zod"
 import { Session } from "../session"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
+import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { Identifier } from "../id/id"
 import { Agent } from "../agent/agent"
 import { SessionPrompt } from "../session/prompt"
@@ -102,7 +103,9 @@ export const TaskTool = Tool.define("task", async (ctx) => {
           ],
         })
       })
-      const msg = await MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID })
+      const msg = ZENGRAM_ENABLED
+        ? await MessageV2.zengramGet({ sessionID: ctx.sessionID, messageID: ctx.messageID })
+        : MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID })
       if (msg.info.role !== "assistant") throw new Error("Not an assistant message")
 
       const model = agent.model ?? {

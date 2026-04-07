@@ -14,6 +14,8 @@ import { SyncEvent } from "../sync"
 import type { SQL } from "../storage/db"
 import { SessionTable } from "./session.sql"
 import { ProjectTable } from "../project/project.sql"
+import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
+import { zengramGetSession, zengramGetChildren, zengramListSessions, zengramListSessionsGlobal, zengramGetProjectSummaries } from "./zengram"
 import { Storage } from "@/storage/storage"
 import { Log } from "../util/log"
 import { updateSchema } from "../util/update-schema"
@@ -401,7 +403,7 @@ export namespace Session {
         }
         log.info("created", result)
 
-        yield* Effect.sync(() => SyncEvent.run(Event.Created, { sessionID: result.id, info: result }))
+        yield* Effect.promise(() => SyncEvent.run(Event.Created, { sessionID: result.id, info: result }))
 
         const cfg = yield* config.get()
         if (!result.parentID && (Flag.OPENCODE_AUTO_SHARE || cfg.share === "auto")) {
@@ -421,6 +423,11 @@ export namespace Session {
       })
 
       const get = Effect.fn("Session.get")(function* (id: SessionID) {
+        if (ZENGRAM_ENABLED) {
+          const info = yield* Effect.promise(() => zengramGetSession(id))
+          if (!info) throw new NotFoundError({ message: `Session not found: ${id}` })
+          return info
+        }
         const row = yield* db((d) => d.select().from(SessionTable).where(eq(SessionTable.id, id)).get())
         if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
         return fromRow(row)
@@ -433,7 +440,7 @@ export namespace Session {
           const { ShareNext } = await import("@/share/share-next")
           return ShareNext.create(id)
         })
-        yield* Effect.sync(() => SyncEvent.run(Event.Updated, { sessionID: id, info: { share: { url: result.url } } }))
+        yield* Effect.promise(() => SyncEvent.run(Event.Updated, { sessionID: id, info: { share: { url: result.url } } }))
         return result
       })
 
@@ -442,11 +449,14 @@ export namespace Session {
           const { ShareNext } = await import("@/share/share-next")
           await ShareNext.remove(id)
         })
-        yield* Effect.sync(() => SyncEvent.run(Event.Updated, { sessionID: id, info: { share: { url: null } } }))
+        yield* Effect.promise(() => SyncEvent.run(Event.Updated, { sessionID: id, info: { share: { url: null } } }))
       })
 
       const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
         const ctx = yield* InstanceState.context
+        if (ZENGRAM_ENABLED) {
+          return yield* Effect.promise(() => zengramGetChildren(ctx.project.id, parentID))
+        }
         const rows = yield* db((d) =>
           d
             .select()
@@ -465,8 +475,8 @@ export namespace Session {
             yield* remove(child.id)
           }
           yield* unshare(sessionID).pipe(Effect.ignore)
-          yield* Effect.sync(() => {
-            SyncEvent.run(Event.Deleted, { sessionID, info: session })
+          yield* Effect.promise(async () => {
+            await SyncEvent.run(Event.Deleted, { sessionID, info: session })
             SyncEvent.remove(sessionID)
           })
         } catch (e) {
@@ -476,13 +486,13 @@ export namespace Session {
 
       const updateMessage = <T extends MessageV2.Info>(msg: T): Effect.Effect<T> =>
         Effect.gen(function* () {
-          yield* Effect.sync(() => SyncEvent.run(MessageV2.Event.Updated, { sessionID: msg.sessionID, info: msg }))
+          yield* Effect.promise(() => SyncEvent.run(MessageV2.Event.Updated, { sessionID: msg.sessionID, info: msg }))
           return msg
         }).pipe(Effect.withSpan("Session.updateMessage"))
 
       const updatePart = <T extends MessageV2.Part>(part: T): Effect.Effect<T> =>
         Effect.gen(function* () {
-          yield* Effect.sync(() =>
+          yield* Effect.promise(() =>
             SyncEvent.run(MessageV2.Event.PartUpdated, {
               sessionID: part.sessionID,
               part: structuredClone(part),
@@ -546,7 +556,7 @@ export namespace Session {
       })
 
       const patch = (sessionID: SessionID, info: Patch) =>
-        Effect.sync(() => SyncEvent.run(Event.Updated, { sessionID, info }))
+        Effect.promise(() => SyncEvent.run(Event.Updated, { sessionID, info }))
 
       const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
         yield* patch(sessionID, { time: { updated: Date.now() } })
@@ -593,8 +603,23 @@ export namespace Session {
       })
 
       const messages = Effect.fn("Session.messages")(function* (input: { sessionID: SessionID; limit?: number }) {
+        if (ZENGRAM_ENABLED) {
+          if (input.limit) {
+            const result = yield* Effect.promise(() =>
+              MessageV2.zengramPage({ sessionID: input.sessionID, limit: input.limit! }),
+            )
+            return result.items
+          }
+          return yield* Effect.promise(async () => {
+            const items: MessageV2.WithParts[] = []
+            for await (const msg of MessageV2.zengramStream(input.sessionID)) {
+              items.push(msg)
+            }
+            return items.reverse()
+          })
+        }
         if (input.limit) {
-          return MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).items
+          return MessageV2.page({ sessionID: input.sessionID, limit: input.limit! }).items
         }
         return Array.from(MessageV2.stream(input.sessionID)).reverse()
       })
@@ -603,7 +628,7 @@ export namespace Session {
         sessionID: SessionID
         messageID: MessageID
       }) {
-        yield* Effect.sync(() =>
+        yield* Effect.promise(() =>
           SyncEvent.run(MessageV2.Event.Removed, {
             sessionID: input.sessionID,
             messageID: input.messageID,
@@ -617,7 +642,7 @@ export namespace Session {
         messageID: MessageID
         partID: PartID
       }) {
-        yield* Effect.sync(() =>
+        yield* Effect.promise(() =>
           SyncEvent.run(MessageV2.Event.PartRemoved, {
             sessionID: input.sessionID,
             messageID: input.messageID,
@@ -736,7 +761,7 @@ export namespace Session {
     runPromise((svc) => svc.messages(input)),
   )
 
-  export function* list(input?: {
+  export async function* list(input?: {
     directory?: string
     workspaceID?: WorkspaceID
     roots?: boolean
@@ -745,6 +770,22 @@ export namespace Session {
     limit?: number
   }) {
     const project = Instance.project
+
+    if (ZENGRAM_ENABLED) {
+      const sessions = await zengramListSessions({
+        projectId: project.id,
+        workspaceID: input?.workspaceID,
+        directory: input?.directory,
+        excludeChildren: input?.roots,
+        since: input?.start,
+        search: input?.search,
+        includeArchived: true,
+        limit: input?.limit ?? 100,
+      })
+      for (const s of sessions) yield s
+      return
+    }
+
     const conditions = [eq(SessionTable.project_id, project.id)]
 
     if (input?.workspaceID) {
@@ -779,7 +820,7 @@ export namespace Session {
     }
   }
 
-  export function* listGlobal(input?: {
+  export async function* listGlobal(input?: {
     directory?: string
     roots?: boolean
     start?: number
@@ -788,6 +829,26 @@ export namespace Session {
     limit?: number
     archived?: boolean
   }) {
+    if (ZENGRAM_ENABLED) {
+      const sessions = await zengramListSessionsGlobal({
+        directory: input?.directory,
+        excludeChildren: input?.roots,
+        since: input?.start,
+        before: input?.cursor,
+        search: input?.search,
+        includeArchived: !!input?.archived,
+        limit: input?.limit ?? 100,
+      })
+      const projectIds = [...new Set(sessions.map((s) => s.projectID))]
+      const projectRows = await zengramGetProjectSummaries(projectIds)
+      const projectMap = new Map(projectRows.map((p) => [p.id, p]))
+      for (const s of sessions) {
+        const proj = projectMap.get(s.projectID) ?? null
+        yield { ...s, project: proj ? { id: proj.id as ProjectID, name: proj.name ?? undefined, worktree: proj.worktree } : null }
+      }
+      return
+    }
+
     const conditions: SQL[] = []
 
     if (input?.directory) {

@@ -3,8 +3,9 @@ import { SyncEvent } from "@/sync"
 import { Session } from "./index"
 import { MessageV2 } from "./message-v2"
 import { SessionTable, MessageTable, PartTable } from "./session.sql"
-import { ProjectTable } from "../project/project.sql"
 import { Log } from "../util/log"
+import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
+import sessionZengramProjectors from "./projectors.zengram"
 
 const log = Log.create({ service: "session.projector" })
 
@@ -61,7 +62,8 @@ export function toPartialRow(info: DeepPartial<Session.Info>) {
   return Object.fromEntries(Object.entries(obj).filter(([_, val]) => val !== undefined))
 }
 
-export default [
+// SQLite projectors (wrapped as async for the unified interface)
+const sqliteProjectors = [
   SyncEvent.project(Session.Event.Created, (db, data) => {
     db.insert(SessionTable).values(Session.toRow(data.info)).run()
   }),
@@ -133,3 +135,6 @@ export default [
     }
   }),
 ]
+
+// Export the appropriate projectors based on the storage backend
+export default ZENGRAM_ENABLED ? sessionZengramProjectors : sqliteProjectors
