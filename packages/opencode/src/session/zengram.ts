@@ -85,6 +85,7 @@ export async function zengramGetChildren(
 }
 
 type SessionListOpts = {
+  workspaceID?: string
   directory?: string
   excludeChildren?: boolean
   since?: number

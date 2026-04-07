@@ -653,11 +653,7 @@ export namespace Project {
   const _PROJECT_SELECT = `SELECT id, name, worktree, vcs, icon_url, icon_color, sandboxes, commands,
       time_created, time_updated, time_initialized FROM project`
 
-  export async function list(): Promise<Info[]> {
-    if (ZENGRAM_ENABLED) {
-      const rows = await zengramDb().query<ZengramProjectRow>(_PROJECT_SELECT, [])
-      return rows.map(zengramRowToProjectInfo)
-    }
+  export function list(): Info[] {
     return Database.use((db) =>
       db
         .select()
@@ -667,11 +663,7 @@ export namespace Project {
     )
   }
 
-  export async function get(id: ProjectID): Promise<Info | undefined> {
-    if (ZENGRAM_ENABLED) {
-      const rows = await zengramDb().query<ZengramProjectRow>(`${_PROJECT_SELECT} WHERE id = $1`, [id])
-      return rows[0] ? zengramRowToProjectInfo(rows[0]) : undefined
-    }
+  export function get(id: ProjectID): Info | undefined {
     const row = Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get())
     if (!row) return undefined
     return fromRow(row)

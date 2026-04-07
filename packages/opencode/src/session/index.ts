@@ -619,9 +619,9 @@ export namespace Session {
           })
         }
         if (input.limit) {
-          return (yield* Effect.promise(() => MessageV2.page({ sessionID: input.sessionID, limit: input.limit! }))).items
+          return MessageV2.page({ sessionID: input.sessionID, limit: input.limit! }).items
         }
-        return (yield* Effect.promise(() => Array.fromAsync(MessageV2.stream(input.sessionID)))).reverse()
+        return Array.from(MessageV2.stream(input.sessionID)).reverse()
       })
 
       const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
@@ -774,7 +774,7 @@ export namespace Session {
     if (ZENGRAM_ENABLED) {
       const sessions = await zengramListSessions({
         projectId: project.id,
-        workspaceId: input?.workspaceID,
+        workspaceID: input?.workspaceID,
         directory: input?.directory,
         excludeChildren: input?.roots,
         since: input?.start,
@@ -844,7 +844,7 @@ export namespace Session {
       const projectMap = new Map(projectRows.map((p) => [p.id, p]))
       for (const s of sessions) {
         const proj = projectMap.get(s.projectID) ?? null
-        yield { ...s, project: proj ? { id: proj.id, name: proj.name ?? undefined, worktree: proj.worktree } : null }
+        yield { ...s, project: proj ? { id: proj.id as ProjectID, name: proj.name ?? undefined, worktree: proj.worktree } : null }
       }
       return
     }

@@ -25,7 +25,7 @@ const log = Log.create({ service: "session.projector.zengram" })
 // ── Session ───────────────────────────────────────────────────────────────────
 
 export default [
-  SyncEvent.project(Session.Event.Created, async (data) => {
+  SyncEvent.projectAsync(Session.Event.Created, async (data) => {
     const info = data.info
     const db = zengramDb()
     const now = Date.now() * 1000
@@ -58,7 +58,7 @@ export default [
     log.info("created session in Zengram", { sessionID: info.id })
   }),
 
-  SyncEvent.project(Session.Event.Updated, async (data) => {
+  SyncEvent.projectAsync(Session.Event.Updated, async (data) => {
     const info = data.info
     const db = zengramDb()
     const now = Date.now() * 1000
@@ -113,14 +113,14 @@ export default [
     )
   }),
 
-  SyncEvent.project(Session.Event.Deleted, async (data) => {
+  SyncEvent.projectAsync(Session.Event.Deleted, async (data) => {
     const db = zengramDb()
     await db.execute(`DELETE FROM session WHERE id = $1`, [data.sessionID])
   }),
 
   // ── Messages (turns) ───────────────────────────────────────────────────────
 
-  SyncEvent.project(MessageV2.Event.Updated, async (data) => {
+  SyncEvent.projectAsync(MessageV2.Event.Updated, async (data) => {
     const info = data.info
     const db = zengramDb()
     const now = Date.now() * 1000
@@ -188,7 +188,7 @@ export default [
     }
   }),
 
-  SyncEvent.project(MessageV2.Event.Removed, async (data) => {
+  SyncEvent.projectAsync(MessageV2.Event.Removed, async (data) => {
     const db = zengramDb()
     await db.execute(
       `DELETE FROM turn WHERE id = $1 AND session_id = $2`,
@@ -198,7 +198,7 @@ export default [
 
   // ── Parts ──────────────────────────────────────────────────────────────────
 
-  SyncEvent.project(MessageV2.Event.PartUpdated, async (data) => {
+  SyncEvent.projectAsync(MessageV2.Event.PartUpdated, async (data) => {
     const part = data.part
     const db = zengramDb()
     const now = data.time * 1000 // microseconds
@@ -254,7 +254,7 @@ export default [
     }
   }),
 
-  SyncEvent.project(MessageV2.Event.PartRemoved, async (data) => {
+  SyncEvent.projectAsync(MessageV2.Event.PartRemoved, async (data) => {
     const db = zengramDb()
     await db.execute(
       `DELETE FROM part WHERE id = $1 AND session_id = $2`,

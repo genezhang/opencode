@@ -957,11 +957,7 @@ export namespace MessageV2 {
 
   // ── end Zengram helpers ───────────────────────────────────────────────────
 
-  export async function page(input: { sessionID: SessionID; limit: number; before?: string }) {
-    if (ZENGRAM_ENABLED) {
-      const beforeDecoded = input.before ? cursor.decode(input.before) : undefined
-      return zengramPage({ sessionID: input.sessionID, limit: input.limit, before: beforeDecoded })
-    }
+  export function page(input: { sessionID: SessionID; limit: number; before?: string }) {
     const before = input.before ? cursor.decode(input.before) : undefined
     const where = before
       ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -998,15 +994,11 @@ export namespace MessageV2 {
     }
   }
 
-  export async function* stream(sessionID: SessionID) {
-    if (ZENGRAM_ENABLED) {
-      yield* zengramStream(sessionID)
-      return
-    }
+  export function* stream(sessionID: SessionID) {
     const size = 50
     let before: string | undefined
     while (true) {
-      const next = await page({ sessionID, limit: size, before })
+      const next = page({ sessionID, limit: size, before })
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {
         yield next.items[i]!
@@ -1016,15 +1008,7 @@ export namespace MessageV2 {
     }
   }
 
-  export async function parts(message_id: MessageID): Promise<MessageV2.Part[]> {
-    if (ZENGRAM_ENABLED) {
-      const db = zengramDb()
-      const rows = await db.query<Record<string, any>>(
-        `SELECT id, turn_id, session_id, type, data, position FROM part WHERE turn_id = $1 ORDER BY position ASC`,
-        [message_id],
-      )
-      return rows.map((row) => zengramPartToMessagePart(row))
-    }
+  export function parts(message_id: MessageID): MessageV2.Part[] {
     const rows = Database.use((db) =>
       db.select().from(PartTable).where(eq(PartTable.message_id, message_id)).orderBy(PartTable.id).all(),
     )
@@ -1039,19 +1023,17 @@ export namespace MessageV2 {
     )
   }
 
-  export async function get(input: { sessionID: SessionID; messageID: MessageID }): Promise<WithParts> {
-    if (ZENGRAM_ENABLED) {
-      const db = zengramDb()
-      const turnRows = await db.query<Record<string, any>>(
-        `SELECT id, session_id, role, agent, model_id, provider_id,
-                tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-                cost_usd, finish_reason, time_created, time_completed
-         FROM turn WHERE id = $1 AND session_id = $2`,
-        [input.messageID, input.sessionID],
-      )
-      if (!turnRows[0]) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
-      return { info: turnToInfo(turnRows[0]), parts: await parts(input.messageID) }
-    }
+  /** Zengram-backend parts reader (async). Used from Effect/async callers when ZENGRAM_ENABLED. */
+  export async function zengramParts(message_id: MessageID): Promise<MessageV2.Part[]> {
+    const db = zengramDb()
+    const rows = await db.query<Record<string, any>>(
+      `SELECT id, turn_id, session_id, type, data, position FROM part WHERE turn_id = $1 ORDER BY position ASC`,
+      [message_id],
+    )
+    return rows.map((row) => zengramPartToMessagePart(row))
+  }
+
+  export function get(input: { sessionID: SessionID; messageID: MessageID }): WithParts {
     const row = Database.use((db) =>
       db
         .select()
@@ -1062,8 +1044,22 @@ export namespace MessageV2 {
     if (!row) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
     return {
       info: info(row),
-      parts: await parts(input.messageID),
+      parts: parts(input.messageID),
     }
+  }
+
+  /** Zengram-backend message getter (async). Used from async callers when ZENGRAM_ENABLED. */
+  export async function zengramGet(input: { sessionID: SessionID; messageID: MessageID }): Promise<WithParts> {
+    const db = zengramDb()
+    const turnRows = await db.query<Record<string, any>>(
+      `SELECT id, session_id, role, agent, model_id, provider_id,
+              tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+              cost_usd, finish_reason, time_created, time_completed
+       FROM turn WHERE id = $1 AND session_id = $2`,
+      [input.messageID, input.sessionID],
+    )
+    if (!turnRows[0]) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
+    return { info: turnToInfo(turnRows[0]), parts: await zengramParts(input.messageID) }
   }
 
   export function filterCompacted(msgs: Iterable<MessageV2.WithParts>) {

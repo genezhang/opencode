@@ -585,7 +585,7 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
         yield* Effect.promise(async () => {
           const end = Date.now() + 500
           while (Date.now() < end) {
-            const parts = await MessageV2.parts(msg.id)
+            const parts = MessageV2.parts(msg.id)
             if (parts.some((part) => part.type === "tool")) return
             await Bun.sleep(10)
           }

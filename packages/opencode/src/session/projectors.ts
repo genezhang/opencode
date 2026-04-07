@@ -64,11 +64,11 @@ export function toPartialRow(info: DeepPartial<Session.Info>) {
 
 // SQLite projectors (wrapped as async for the unified interface)
 const sqliteProjectors = [
-  SyncEvent.sqliteProject(Session.Event.Created, (db, data) => {
+  SyncEvent.project(Session.Event.Created, (db, data) => {
     db.insert(SessionTable).values(Session.toRow(data.info)).run()
   }),
 
-  SyncEvent.sqliteProject(Session.Event.Updated, (db, data) => {
+  SyncEvent.project(Session.Event.Updated, (db, data) => {
     const info = data.info
     const row = db
       .update(SessionTable)
@@ -79,11 +79,11 @@ const sqliteProjectors = [
     if (!row) throw new NotFoundError({ message: `Session not found: ${data.sessionID}` })
   }),
 
-  SyncEvent.sqliteProject(Session.Event.Deleted, (db, data) => {
+  SyncEvent.project(Session.Event.Deleted, (db, data) => {
     db.delete(SessionTable).where(eq(SessionTable.id, data.sessionID)).run()
   }),
 
-  SyncEvent.sqliteProject(MessageV2.Event.Updated, (db, data) => {
+  SyncEvent.project(MessageV2.Event.Updated, (db, data) => {
     const time_created = data.info.time.created
     const { id, sessionID, ...rest } = data.info
 
@@ -103,19 +103,19 @@ const sqliteProjectors = [
     }
   }),
 
-  SyncEvent.sqliteProject(MessageV2.Event.Removed, (db, data) => {
+  SyncEvent.project(MessageV2.Event.Removed, (db, data) => {
     db.delete(MessageTable)
       .where(and(eq(MessageTable.id, data.messageID), eq(MessageTable.session_id, data.sessionID)))
       .run()
   }),
 
-  SyncEvent.sqliteProject(MessageV2.Event.PartRemoved, (db, data) => {
+  SyncEvent.project(MessageV2.Event.PartRemoved, (db, data) => {
     db.delete(PartTable)
       .where(and(eq(PartTable.id, data.partID), eq(PartTable.session_id, data.sessionID)))
       .run()
   }),
 
-  SyncEvent.sqliteProject(MessageV2.Event.PartUpdated, (db, data) => {
+  SyncEvent.project(MessageV2.Event.PartUpdated, (db, data) => {
     const { id, messageID, sessionID, ...rest } = data.part
 
     try {

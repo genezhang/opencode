@@ -107,23 +107,23 @@ export namespace SyncEvent {
   }
 
   /**
-   * Register an async projector for Zengram storage backend.
+   * Register a synchronous SQLite projector (receives a Drizzle tx).
    */
   export function project<Def extends Definition>(
-    def: Def,
-    func: (data: Event<Def>["data"]) => Promise<void>,
-  ): [Definition, AsyncProjectorFunc] {
-    return [def, func as AsyncProjectorFunc]
-  }
-
-  /**
-   * Register a synchronous SQLite projector (legacy API, unchanged).
-   */
-  export function sqliteProject<Def extends Definition>(
     def: Def,
     func: (db: Database.TxOrDb, data: Event<Def>["data"]) => void,
   ): [Definition, SyncProjectorFunc] {
     return [def, func as SyncProjectorFunc]
+  }
+
+  /**
+   * Register an async projector for Zengram storage backend.
+   */
+  export function projectAsync<Def extends Definition>(
+    def: Def,
+    func: (data: Event<Def>["data"]) => Promise<void>,
+  ): [Definition, AsyncProjectorFunc] {
+    return [def, func as AsyncProjectorFunc]
   }
 
   function publishEvent(def: Definition, event: Event, options: { publish: boolean }) {
