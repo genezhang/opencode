@@ -12,6 +12,7 @@ import { Log } from "@/util/log"
 import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
+import { EXTRACT_FACTS_SYSTEM_PROMPT } from "./prompts"
 
 const log = Log.create({ service: "knowledge" })
 
@@ -369,12 +370,7 @@ async function extractFactsWithLlm(text: string): Promise<Array<{ subject: strin
 
     const { text: output } = await generateText({
       model: language,
-      system:
-        "Extract up to 5 durable, project-specific facts from this AI assistant message. " +
-        "Return a JSON array of objects with 'subject' (< 60 chars, a short title) and " +
-        "'content' (< 200 chars, the complete fact). Only include normative, reusable facts — " +
-        "conventions, constraints, patterns, rules. Return [] if none qualify. " +
-        "Respond with raw JSON only, no markdown fences.",
+      system: EXTRACT_FACTS_SYSTEM_PROMPT,
       prompt: text.slice(0, 4000),
     })
 

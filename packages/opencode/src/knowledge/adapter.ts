@@ -9,6 +9,7 @@ import { generateText } from "ai"
 import { Provider } from "@/provider/provider"
 import { Log } from "@/util/log"
 import { llm } from "@zengram/sdk"
+import { EXTRACT_FACTS_SYSTEM_PROMPT, REFLECT_SYSTEM_PROMPT } from "./prompts"
 
 const log = Log.create({ service: "knowledge.adapter" })
 
@@ -22,12 +23,7 @@ class OpenCodeLlmAdapter implements llm.LlmAdapter {
 
       const { text: output } = await generateText({
         model: language,
-        system:
-          "Extract up to 5 durable, project-specific facts from this AI assistant message. " +
-          "Return a JSON array of objects with 'subject' (< 60 chars) and " +
-          "'content' (< 200 chars). Only include normative, reusable facts — " +
-          "conventions, constraints, patterns, rules. Return [] if none qualify. " +
-          "Respond with raw JSON only, no markdown fences.",
+        system: EXTRACT_FACTS_SYSTEM_PROMPT,
         prompt: text.slice(0, 4000),
       })
 
@@ -59,12 +55,7 @@ class OpenCodeLlmAdapter implements llm.LlmAdapter {
 
       const { text: output } = await generateText({
         model: language,
-        system:
-          "You are synthesizing a knowledge base for an AI coding agent. " +
-          "Given a list of known facts, identify 1-3 higher-level principles or patterns " +
-          "that are implied but not explicitly stated. " +
-          "Return a JSON array of objects with 'subject' (< 60 chars) and 'content' (< 200 chars). " +
-          "Return [] if no meaningful synthesis is possible. Raw JSON only, no markdown.",
+        system: REFLECT_SYSTEM_PROMPT,
         prompt: `Known facts:\n${factList}`,
       })
 

@@ -23,6 +23,16 @@ import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "session.projector.zengram" })
 
+// Map tool name → (operation type, input field holding the file path).
+// Hoisted to module scope to avoid repeated allocation on every PartUpdated event.
+const FILE_TOOLS: Record<string, { op: coding.FileOperation["operation"]; field: string }> = {
+  write:     { op: "write", field: "filePath" },
+  edit:      { op: "write", field: "filePath" },
+  multiedit: { op: "write", field: "filePath" },
+  read:      { op: "read",  field: "filePath" },
+  list:      { op: "list",  field: "path" },
+}
+
 // ── Session ───────────────────────────────────────────────────────────────────
 
 export default [
@@ -253,38 +263,47 @@ export default [
         ],
       )
 
-      // Record file operations for completed file-modifying tool calls.
+      // Record file operations for completed file-touching tool calls.
       if (toolState === "completed") {
         const toolName: string = toolData.toolName ?? ""
-        const input = toolData.input as Record<string, unknown> ?? {}
+        const input = (toolData.input ?? {}) as Record<string, unknown>
 
-        // Map tool name → operation type and file path field.
-        const FILE_TOOLS: Record<string, { op: coding.FileOperation["operation"]; field: string }> = {
-          write: { op: "write", field: "filePath" },
-          edit: { op: "write", field: "filePath" },
-          multiedit: { op: "write", field: "filePath" },
-          read: { op: "read", field: "filePath" },
-          list: { op: "list", field: "path" },
-        }
         const mapping = FILE_TOOLS[toolName]
         if (mapping) {
           const filePath = input[mapping.field]
           if (typeof filePath === "string" && filePath) {
+            const isWrite = mapping.op === "write"
+            const isRead = mapping.op === "read"
             coding.recordFileOperation(db, {
-              toolCallId: id,
-              sessionId: sessionID,
-              filePath,
-              operation: mapping.op,
+              toolCallId: id, sessionId: sessionID, filePath, operation: mapping.op,
             }).catch((e: unknown) => log.warn("file_operation record failed", { err: e }))
-
             coding.upsertWorkspaceFile(db, {
-              sessionId: sessionID,
-              filePath,
-              understanding: mapping.op === "write" ? "deep" : mapping.op === "read" ? "read" : "listed",
-              editState: mapping.op === "write" ? "modified" : undefined,
-              ...(mapping.op === "write" ? { lastWriteTurn: messageID } : {}),
-              ...(mapping.op === "read" ? { lastReadTurn: messageID } : {}),
+              sessionId: sessionID, filePath,
+              understanding: isWrite ? "deep" : isRead ? "read" : "listed",
+              editState: isWrite ? "modified" : undefined,
+              ...(isWrite ? { lastWriteTurn: messageID } : {}),
+              ...(isRead  ? { lastReadTurn: messageID } : {}),
             }).catch((e: unknown) => log.warn("workspace_file upsert failed", { err: e }))
+          }
+        }
+
+        // apply_patch modifies multiple files; extract paths from the unified diff.
+        if (toolName === "apply_patch") {
+          const patchText = input.patchText
+          if (typeof patchText === "string") {
+            const pathMatches = [...patchText.matchAll(/^\+\+\+ b\/(.+)$/gm)]
+            for (const match of pathMatches) {
+              const rel = match[1].trim()
+              if (!rel) continue
+              const filePath = rel.startsWith("/") ? rel : `${Instance.directory}/${rel}`
+              coding.recordFileOperation(db, {
+                toolCallId: id, sessionId: sessionID, filePath, operation: "write",
+              }).catch((e: unknown) => log.warn("file_operation record failed (apply_patch)", { err: e }))
+              coding.upsertWorkspaceFile(db, {
+                sessionId: sessionID, filePath,
+                understanding: "deep", editState: "modified", lastWriteTurn: messageID,
+              }).catch((e: unknown) => log.warn("workspace_file upsert failed (apply_patch)", { err: e }))
+            }
           }
         }
       }
