@@ -12,7 +12,7 @@ import { Log } from "@/util/log"
 import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
-import { EXTRACT_FACTS_SYSTEM_PROMPT } from "./prompts"
+import { EXTRACT_FACTS_SYSTEM_PROMPT, REFLECT_SYSTEM_PROMPT } from "./prompts"
 
 const log = Log.create({ service: "knowledge" })
 
@@ -24,7 +24,7 @@ export type KnowledgeEntry = {
   subject: string
   content: string
   importance: number
-  source_session?: string
+  source_session?: string | null
 }
 
 /**
@@ -36,8 +36,8 @@ export async function learnFact(input: {
   scope: KnowledgeScope
   subject: string
   content: string
-  sourceSession: SessionID
-  sourceTurn: MessageID
+  sourceSession?: SessionID // optional — null stored for synthetic entries (e.g. reflections)
+  sourceTurn?: MessageID
 }): Promise<{ id: string; isNew: boolean }> {
   const db = zengramDb()
   const now = Date.now() * 1000
@@ -50,7 +50,11 @@ export async function learnFact(input: {
     [input.projectId, input.scope, input.subject],
   )
   if (existing[0]) {
-    const isCrossSession = existing[0].source_session !== input.sourceSession
+    // Cross-session confirmation only fires when both sessions are known and distinct.
+    const isCrossSession =
+      input.sourceSession != null &&
+      existing[0].source_session != null &&
+      existing[0].source_session !== input.sourceSession
     if (isCrossSession) {
       // Cross-session confirmation: the same fact appeared independently in another
       // session — boost importance and confidence so it surfaces more in recall.
@@ -82,7 +86,7 @@ export async function learnFact(input: {
         status, importance, confidence, access_count, time_created, time_updated)
      VALUES ($1,$2,$3,$4,$5,'agent',$6,$7,'active',0.7,0.8,0,$8,$9)`,
     [id, input.projectId, input.scope, input.subject, input.content,
-     input.sourceSession, input.sourceTurn, now, now],
+     input.sourceSession ?? null, input.sourceTurn ?? null, now, now],
   )
   // Compute and store embedding server-side via Zeta's embed() function.
   // Fire-and-forget: embedding is best-effort; retrieval falls back to FTS if null.
@@ -354,6 +358,15 @@ export async function extractAndLearn(input: {
     if (isNew) stored++
   }
   log.info("passive extraction done", { turnId: input.turnId, stored })
+
+  // After storing new facts, opportunistically synthesize higher-level patterns.
+  // reflectKnowledge() has its own minFacts guard (total active facts >= 5) and is
+  // throttled to once per 6 hours — safe to call fire-and-forget on every turn.
+  if (stored > 0) {
+    reflectKnowledge({ projectId: input.projectId })
+      .catch((e) => log.warn("reflection failed", { err: e }))
+  }
+
   return stored
 }
 
@@ -473,4 +486,171 @@ export function formatKnowledgeBlock(facts: KnowledgeEntry[]): string | null {
   if (facts.length === 0) return null
   const lines = facts.map((f) => `- **${f.subject}**: ${f.content}`)
   return `<zengram-knowledge>\nThe following facts were recalled from persistent memory:\n${lines.join("\n")}\n</zengram-knowledge>`
+}
+
+// ── Reflection ────────────────────────────────────────────────────────────────
+
+// Throttle reflection to at most once every 6 hours per project.
+const _lastReflectRun = new Map<string, number>()
+const REFLECT_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+/**
+ * Synthesize higher-level patterns from recent knowledge and store them back.
+ * Throttled to run at most once per 6 hours per project.
+ * Called fire-and-forget from extractAndLearn after new facts are stored.
+ */
+export async function reflectKnowledge(input: {
+  projectId: ProjectID
+  minFacts?: number // skip if fewer than this many active knowledge entries
+}): Promise<number> {
+  const now = Date.now()
+  const lastRun = _lastReflectRun.get(input.projectId) ?? 0
+  if (now - lastRun < REFLECT_INTERVAL_MS) return 0
+
+  const db = zengramDb()
+  const minFacts = input.minFacts ?? 5
+
+  // Fetch recent active knowledge to reflect on.
+  const rows = await db.query<{ subject: string; content: string }>(
+    `SELECT subject, content FROM knowledge
+     WHERE project_id = $1 AND status = 'active'
+     ORDER BY importance DESC, time_updated DESC
+     LIMIT 20`,
+    [input.projectId],
+  )
+  if (rows.length < minFacts) return 0
+
+  // Mark as attempted before the LLM call so concurrent turns don't pile up
+  // and a model that repeatedly returns non-JSON doesn't spam on every turn.
+  _lastReflectRun.set(input.projectId, now)
+
+  let insights: Array<{ subject: string; content: string }> = []
+  try {
+    const modelRef = await Provider.defaultModel()
+    const smallModel = await Provider.getSmallModel(modelRef.providerID)
+    const fullModel = smallModel ?? (await Provider.getModel(modelRef.providerID, modelRef.modelID))
+    const language = await Provider.getLanguage(fullModel)
+
+    const factList = rows.map((r) => `- ${r.subject}: ${r.content}`).join("\n")
+    const { text: output } = await generateText({
+      model: language,
+      system: REFLECT_SYSTEM_PROMPT,
+      prompt: `Known facts:\n${factList}`,
+    })
+
+    const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
+    const parsed = JSON.parse(cleaned)
+    if (!Array.isArray(parsed)) return 0
+    insights = parsed
+      .filter(
+        (f): f is { subject: string; content: string } =>
+          typeof f?.subject === "string" && typeof f?.content === "string",
+      )
+      .map((f) => ({ subject: f.subject.trim(), content: f.content.trim() }))
+      .filter((f) => f.subject.length > 0 && f.content.length > 0)
+      .slice(0, 3)
+  } catch (e) {
+    log.warn("reflection failed", { err: e })
+    return 0
+  }
+
+  let stored = 0
+  for (const insight of insights) {
+    try {
+      const { isNew } = await learnFact({
+        projectId: input.projectId,
+        scope: "/project",
+        subject: insight.subject,
+        content: insight.content,
+        // sourceSession/sourceTurn are omitted — reflection has no FK-valid origin.
+      })
+      if (isNew) stored++
+    } catch (e) {
+      log.warn("reflection store failed", { err: e })
+    }
+  }
+  log.info("reflection done", { projectId: input.projectId, stored })
+  return stored
+}
+
+// ── Workspace context ─────────────────────────────────────────────────────────
+
+export type WorkspaceFileEntry = {
+  file_path: string
+  understanding: string // 'deep' | 'read' | 'listed' | 'unknown'
+  edit_state: string   // 'modified' | 'clean' | 'deleted'
+  relevance: number
+}
+
+/**
+ * Fetch files touched in this session, ordered by recency and edit state.
+ * Modified files surface first, then deeply-read files, then others.
+ */
+export async function recallWorkspaceContext(input: {
+  sessionId: SessionID
+  limit?: number
+}): Promise<WorkspaceFileEntry[]> {
+  const db = zengramDb()
+  // Validate before interpolation (Zeta plan-cache bug requires LIMIT to be
+  // string-interpolated, not parameterized — so NaN/Infinity must be guarded).
+  const rawLimit = input.limit
+  const limit = Number.isFinite(rawLimit) && rawLimit! > 0
+    ? Math.min(Math.floor(rawLimit!), 100)
+    : 30
+
+  return db.query<WorkspaceFileEntry>(
+    `SELECT file_path, understanding, edit_state, relevance
+     FROM workspace_file
+     WHERE session_id = $1
+     ORDER BY
+       CASE edit_state WHEN 'modified' THEN 0 WHEN 'deleted' THEN 1 ELSE 2 END,
+       CASE understanding WHEN 'deep' THEN 0 WHEN 'read' THEN 1 ELSE 2 END,
+       relevance DESC,
+       time_updated DESC
+     LIMIT ${limit}`,
+    [input.sessionId],
+  )
+}
+
+/**
+ * Format workspace file context as a system-prompt block.
+ * Returns null if no files have been touched.
+ */
+/** Sanitize a file path for safe inclusion in an XML-like prompt block. */
+function sanitizePath(p: string): string {
+  return p
+    .replace(/&/g, "&amp;")   // must come first before other entity replacements
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+}
+
+export function formatWorkspaceBlock(files: WorkspaceFileEntry[]): string | null {
+  if (files.length === 0) return null
+
+  const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
+  const unmodified = files.filter((f) => f.edit_state !== "modified" && f.edit_state !== "deleted")
+  // Distinguish actually-read files from those only listed (e.g. directory scans).
+  const read   = unmodified.filter((f) => f.understanding === "deep" || f.understanding === "read")
+  const listed = unmodified.filter((f) => f.understanding === "listed")
+
+  const lines: string[] = []
+  if (modified.length > 0) {
+    lines.push("Modified in this session:")
+    for (const f of modified) {
+      const tag = f.edit_state === "deleted" ? " (deleted)" : ""
+      lines.push(`  - ${sanitizePath(f.file_path)}${tag}`)
+    }
+  }
+  if (read.length > 0) {
+    lines.push("Read in this session:")
+    for (const f of read.slice(0, 10)) lines.push(`  - ${sanitizePath(f.file_path)}`)
+  }
+  if (listed.length > 0) {
+    lines.push("Directories listed in this session:")
+    for (const f of listed.slice(0, 5)) lines.push(`  - ${sanitizePath(f.file_path)}`)
+  }
+
+  if (lines.length === 0) return null
+  return `<zengram-workspace>\n${lines.join("\n")}\n</zengram-workspace>`
 }

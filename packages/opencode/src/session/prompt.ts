@@ -43,7 +43,7 @@ import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
-import { recallFacts, formatKnowledgeBlock } from "@/knowledge"
+import { recallFacts, formatKnowledgeBlock, recallWorkspaceContext, formatWorkspaceBlock } from "@/knowledge"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
 import { Truncate } from "@/tool/truncate"
@@ -1500,7 +1500,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
                 yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-                const [skills, env, instructions, modelMsgs, knowledgeFacts] = yield* Effect.all([
+                const [skills, env, instructions, modelMsgs, knowledgeFacts, workspaceFiles] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.skills(agent)),
                   Effect.promise(() => SystemPrompt.environment(model)),
                   instruction.system().pipe(Effect.orDie),
@@ -1514,13 +1514,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                         return recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined })
                       })
                     : Effect.succeed([]),
+                  ZENGRAM_ENABLED
+                    ? Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID }))
+                    : Effect.succeed([]),
                 ])
                 const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
+                const workspaceBlock = formatWorkspaceBlock(workspaceFiles)
                 const system = [
                   ...env,
                   ...(skills ? [skills] : []),
                   ...instructions,
                   ...(knowledgeBlock ? [knowledgeBlock] : []),
+                  ...(workspaceBlock ? [workspaceBlock] : []),
                 ]
                 const format = lastUser.format ?? { type: "text" as const }
                 if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
