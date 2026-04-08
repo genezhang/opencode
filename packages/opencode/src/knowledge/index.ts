@@ -24,7 +24,7 @@ export type KnowledgeEntry = {
   subject: string
   content: string
   importance: number
-  source_session?: string
+  source_session?: string | null
 }
 
 /**
@@ -508,7 +508,6 @@ export async function reflectKnowledge(input: {
   if (now - lastRun < REFLECT_INTERVAL_MS) return 0
 
   const db = zengramDb()
-  const nowMicros = now * 1000
   const minFacts = input.minFacts ?? 5
 
   // Fetch recent active knowledge to reflect on.
@@ -619,7 +618,11 @@ export async function recallWorkspaceContext(input: {
  */
 /** Sanitize a file path for safe inclusion in an XML-like prompt block. */
 function sanitizePath(p: string): string {
-  return p.replace(/\n/g, " ").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return p
+    .replace(/&/g, "&amp;")   // must come first before other entity replacements
+    .replace(/[\r\n\t]/g, " ")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
 }
 
 export function formatWorkspaceBlock(files: WorkspaceFileEntry[]): string | null {
