@@ -12,7 +12,7 @@ import { Log } from "@/util/log"
 import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
-import { EXTRACT_FACTS_SYSTEM_PROMPT } from "./prompts"
+import { EXTRACT_FACTS_SYSTEM_PROMPT, REFLECT_SYSTEM_PROMPT } from "./prompts"
 
 const log = Log.create({ service: "knowledge" })
 
@@ -354,6 +354,14 @@ export async function extractAndLearn(input: {
     if (isNew) stored++
   }
   log.info("passive extraction done", { turnId: input.turnId, stored })
+
+  // After storing new facts, opportunistically synthesize higher-level patterns.
+  // Throttled internally to at most once per 6 hours — safe to call on every turn.
+  if (stored > 0) {
+    reflectKnowledge({ projectId: input.projectId })
+      .catch((e) => log.warn("reflection failed", { err: e }))
+  }
+
   return stored
 }
 
@@ -473,4 +481,148 @@ export function formatKnowledgeBlock(facts: KnowledgeEntry[]): string | null {
   if (facts.length === 0) return null
   const lines = facts.map((f) => `- **${f.subject}**: ${f.content}`)
   return `<zengram-knowledge>\nThe following facts were recalled from persistent memory:\n${lines.join("\n")}\n</zengram-knowledge>`
+}
+
+// ── Reflection ────────────────────────────────────────────────────────────────
+
+// Throttle reflection to at most once every 6 hours per project.
+const _lastReflectRun = new Map<string, number>()
+const REFLECT_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+/**
+ * Synthesize higher-level patterns from recent knowledge and store them back.
+ * Throttled to run at most once per 6 hours per project.
+ * Called fire-and-forget from extractAndLearn after new facts are stored.
+ */
+export async function reflectKnowledge(input: {
+  projectId: ProjectID
+  minFacts?: number // skip if fewer than this many active knowledge entries
+}): Promise<number> {
+  const now = Date.now()
+  const lastRun = _lastReflectRun.get(input.projectId) ?? 0
+  if (now - lastRun < REFLECT_INTERVAL_MS) return 0
+
+  const db = zengramDb()
+  const nowMicros = now * 1000
+  const minFacts = input.minFacts ?? 5
+
+  // Fetch recent active knowledge to reflect on.
+  const rows = await db.query<{ subject: string; content: string }>(
+    `SELECT subject, content FROM knowledge
+     WHERE project_id = $1 AND status = 'active'
+     ORDER BY importance DESC, time_updated DESC
+     LIMIT 20`,
+    [input.projectId],
+  )
+  if (rows.length < minFacts) return 0
+
+  let insights: Array<{ subject: string; content: string }> = []
+  try {
+    const modelRef = await Provider.defaultModel()
+    const smallModel = await Provider.getSmallModel(modelRef.providerID)
+    const fullModel = smallModel ?? (await Provider.getModel(modelRef.providerID, modelRef.modelID))
+    const language = await Provider.getLanguage(fullModel)
+
+    const factList = rows.map((r) => `- ${r.subject}: ${r.content}`).join("\n")
+    const { text: output } = await generateText({
+      model: language,
+      system: REFLECT_SYSTEM_PROMPT,
+      prompt: `Known facts:\n${factList}`,
+    })
+
+    const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
+    const parsed = JSON.parse(cleaned)
+    if (!Array.isArray(parsed)) return 0
+    insights = parsed
+      .filter(
+        (f): f is { subject: string; content: string } =>
+          typeof f?.subject === "string" && typeof f?.content === "string",
+      )
+      .map((f) => ({ subject: f.subject.trim(), content: f.content.trim() }))
+      .filter((f) => f.subject.length > 0 && f.content.length > 0)
+      .slice(0, 3)
+  } catch (e) {
+    log.warn("reflection failed", { err: e })
+    return 0
+  }
+
+  _lastReflectRun.set(input.projectId, now)
+  let stored = 0
+  for (const insight of insights) {
+    try {
+      const { isNew } = await learnFact({
+        projectId: input.projectId,
+        scope: "/project",
+        subject: insight.subject,
+        content: insight.content,
+        sourceSession: "reflection" as SessionID,
+        sourceTurn: "reflection" as MessageID,
+      })
+      if (isNew) stored++
+    } catch (e) {
+      log.warn("reflection store failed", { err: e })
+    }
+  }
+  log.info("reflection done", { projectId: input.projectId, stored })
+  return stored
+}
+
+// ── Workspace context ─────────────────────────────────────────────────────────
+
+export type WorkspaceFileEntry = {
+  file_path: string
+  understanding: string // 'deep' | 'read' | 'listed' | 'unknown'
+  edit_state: string   // 'modified' | 'clean' | 'deleted'
+  relevance: number
+}
+
+/**
+ * Fetch files touched in this session, ordered by recency and edit state.
+ * Modified files surface first, then deeply-read files, then others.
+ */
+export async function recallWorkspaceContext(input: {
+  sessionId: SessionID
+  limit?: number
+}): Promise<WorkspaceFileEntry[]> {
+  const db = zengramDb()
+  const limit = Math.min(input.limit ?? 30, 100)
+
+  return db.query<WorkspaceFileEntry>(
+    `SELECT file_path, understanding, edit_state, relevance
+     FROM workspace_file
+     WHERE session_id = $1
+     ORDER BY
+       CASE edit_state WHEN 'modified' THEN 0 WHEN 'deleted' THEN 1 ELSE 2 END,
+       CASE understanding WHEN 'deep' THEN 0 WHEN 'read' THEN 1 ELSE 2 END,
+       relevance DESC,
+       time_updated DESC
+     LIMIT ${limit}`,
+    [input.sessionId],
+  )
+}
+
+/**
+ * Format workspace file context as a system-prompt block.
+ * Returns null if no files have been touched.
+ */
+export function formatWorkspaceBlock(files: WorkspaceFileEntry[]): string | null {
+  if (files.length === 0) return null
+
+  const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
+  const read = files.filter((f) => f.edit_state !== "modified" && f.edit_state !== "deleted")
+
+  const lines: string[] = []
+  if (modified.length > 0) {
+    lines.push("Modified in this session:")
+    for (const f of modified) {
+      const tag = f.edit_state === "deleted" ? " (deleted)" : ""
+      lines.push(`  - ${f.file_path}${tag}`)
+    }
+  }
+  if (read.length > 0) {
+    lines.push("Read in this session:")
+    for (const f of read.slice(0, 10)) lines.push(`  - ${f.file_path}`)
+  }
+
+  return `<zengram-workspace>\n${lines.join("\n")}\n</zengram-workspace>`
 }
