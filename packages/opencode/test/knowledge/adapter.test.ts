@@ -5,20 +5,14 @@
  * without requiring a real LLM provider or Zengram database.
  */
 
-import { describe, test, expect, beforeEach, mock } from "bun:test"
+import { describe, test, expect, beforeEach } from "bun:test"
 import { llm } from "@zengram/sdk"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Build a mock LanguageModel that returns a fixed text string. */
-function mockLanguage(text: string) {
-  return { text } as any
-}
-
 /**
- * Directly exercise the JSON-parsing + guard logic that both extractFacts and
- * reflect use. We extract these as standalone helpers so they can be tested
- * without standing up a full Provider + generateText pipeline.
+ * Mirrors the JSON-parsing + guard logic used by extractFacts and reflect
+ * in adapter.ts so it can be tested without a live Provider/generateText call.
  */
 function parseFactsOutput(output: string): Array<{ subject: string; content: string }> {
   const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()

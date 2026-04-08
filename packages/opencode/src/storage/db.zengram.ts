@@ -42,7 +42,7 @@ class ZengramClient implements Queryable {
     return new ZengramClient(pool)
   }
 
-  async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
     const result = await this.pool.query(sql, params)
     return result.rows as T[]
   }
