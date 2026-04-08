@@ -18,9 +18,23 @@ import { zengramDb } from "@/storage/db.zengram"
 import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
 import { extractAndLearn, decayKnowledge } from "@/knowledge"
+import { coding } from "@zengram/sdk"
+import type { FileOperation } from "@zengram/sdk"
 import { Instance } from "@/project/instance"
+import { Patch } from "@/patch"
+import path from "path"
 
 const log = Log.create({ service: "session.projector.zengram" })
+
+// Map tool name → (operation type, input field holding the file path).
+// Hoisted to module scope to avoid repeated allocation on every PartUpdated event.
+const FILE_TOOLS: Record<string, { op: FileOperation["operation"]; field: string }> = {
+  write:     { op: "write", field: "filePath" },
+  edit:      { op: "write", field: "filePath" },
+  multiedit: { op: "write", field: "filePath" },
+  read:      { op: "read",  field: "filePath" },
+  list:      { op: "list",  field: "path" },
+}
 
 // ── Session ───────────────────────────────────────────────────────────────────
 
@@ -251,6 +265,69 @@ export default [
           toolState === "completed" || toolState === "error" ? now : null,
         ],
       )
+
+      // Record file operations for completed file-touching tool calls.
+      if (toolState === "completed") {
+        // Normalize to lowercase: the LLM tool-call repair path lowercases names.
+        const toolName: string = (toolData.toolName ?? "").toLowerCase()
+        const input = (toolData.input ?? {}) as Record<string, unknown>
+
+        const mapping = FILE_TOOLS[toolName]
+        if (mapping) {
+          // Normalize the path: tools accept relative paths and resolve them internally.
+          // `list` defaults to the project directory when `path` is omitted.
+          const rawPath = input[mapping.field] as string | undefined
+            ?? (toolName === "list" ? Instance.directory : undefined)
+          if (typeof rawPath === "string" && rawPath) {
+            const filePath = path.isAbsolute(rawPath)
+              ? rawPath
+              : path.resolve(Instance.directory, rawPath)
+            const isWrite = mapping.op === "write"
+            const isRead = mapping.op === "read"
+            coding.recordFileOperation(db, {
+              toolCallId: id, sessionId: sessionID, filePath, operation: mapping.op,
+            }).catch((e: unknown) => log.warn("file_operation record failed", { err: e }))
+            coding.upsertWorkspaceFile(db, {
+              sessionId: sessionID, filePath,
+              understanding: isWrite ? "deep" : isRead ? "read" : "listed",
+              editState: isWrite ? "modified" : undefined,
+              ...(isWrite ? { lastWriteTurn: messageID } : {}),
+              ...(isRead  ? { lastReadTurn: messageID } : {}),
+            }).catch((e: unknown) => log.warn("workspace_file upsert failed", { err: e }))
+          }
+        }
+
+        // apply_patch uses OpenCode's custom *** Begin Patch format, not unified diff.
+        // Use Patch.parsePatch (same parser the tool itself uses) to extract hunks.
+        if (toolName === "apply_patch") {
+          const patchText = input.patchText
+          if (typeof patchText === "string") {
+            try {
+              const { hunks } = Patch.parsePatch(patchText)
+              for (const hunk of hunks) {
+                const filePath = path.resolve(Instance.directory, hunk.path)
+                const operation: FileOperation["operation"] = hunk.type === "delete" ? "delete" : "write"
+                coding.recordFileOperation(db, {
+                  toolCallId: id, sessionId: sessionID, filePath, operation,
+                }).catch((e: unknown) => log.warn("file_operation record failed (apply_patch)", { err: e }))
+                coding.upsertWorkspaceFile(db, {
+                  sessionId: sessionID, filePath, understanding: "deep",
+                  editState: hunk.type === "delete" ? "clean" : "modified",
+                  lastWriteTurn: messageID,
+                }).catch((e: unknown) => log.warn("workspace_file upsert failed (apply_patch)", { err: e }))
+                // For move operations, also record the destination path.
+                if (hunk.type === "update" && hunk.move_path) {
+                  const movePath = path.resolve(Instance.directory, hunk.move_path)
+                  coding.upsertWorkspaceFile(db, {
+                    sessionId: sessionID, filePath: movePath,
+                    understanding: "deep", editState: "modified", lastWriteTurn: messageID,
+                  }).catch((e: unknown) => log.warn("workspace_file upsert failed (apply_patch move)", { err: e }))
+                }
+              }
+            } catch { /* patchText format unrecognized — skip file op recording */ }
+          }
+        }
+      }
     }
   }),
 
