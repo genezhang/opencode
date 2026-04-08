@@ -19,13 +19,14 @@ import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
 import { extractAndLearn, decayKnowledge } from "@/knowledge"
 import { coding } from "@zengram/sdk"
+import type { FileOperation } from "@zengram/sdk"
 import { Instance } from "@/project/instance"
 
 const log = Log.create({ service: "session.projector.zengram" })
 
 // Map tool name → (operation type, input field holding the file path).
 // Hoisted to module scope to avoid repeated allocation on every PartUpdated event.
-const FILE_TOOLS: Record<string, { op: coding.FileOperation["operation"]; field: string }> = {
+const FILE_TOOLS: Record<string, { op: FileOperation["operation"]; field: string }> = {
   write:     { op: "write", field: "filePath" },
   edit:      { op: "write", field: "filePath" },
   multiedit: { op: "write", field: "filePath" },

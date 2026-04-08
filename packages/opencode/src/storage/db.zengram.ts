@@ -12,7 +12,7 @@
 import pg from "pg"
 
 export interface Queryable {
-  query<T extends Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>
   execute(sql: string, params?: unknown[]): Promise<number>
 }
 
@@ -42,7 +42,7 @@ class ZengramClient implements Queryable {
     return new ZengramClient(pool)
   }
 
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+  async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
     const result = await this.pool.query(sql, params)
     return result.rows as T[]
   }

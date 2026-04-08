@@ -27,7 +27,7 @@ const log = Log.create({ service: "zeta-embedded" })
 class EmbeddedClient implements Queryable {
   constructor(private db: Database) {}
 
-  async query<T extends Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+  async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
     return this.db.query(sql, params as any) as T[]
   }
 
