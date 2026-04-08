@@ -7,6 +7,7 @@
 
 import { describe, test, expect, beforeEach } from "bun:test"
 import { llm } from "@zengram/sdk"
+import { registerLlmAdapter } from "@/knowledge/adapter"
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -14,14 +15,23 @@ import { llm } from "@zengram/sdk"
  * Mirrors the JSON-parsing + guard logic used by extractFacts and reflect
  * in adapter.ts so it can be tested without a live Provider/generateText call.
  */
+/**
+ * Mirrors the JSON-parsing + guard logic used by extractFacts and reflect
+ * in adapter.ts, including the try/catch that returns [] on parse failure.
+ * This keeps the test contract aligned with what callers of those methods see.
+ */
 function parseFactsOutput(output: string): Array<{ subject: string; content: string }> {
-  const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
-  const parsed = JSON.parse(cleaned)
-  if (!Array.isArray(parsed)) return []
-  return parsed.filter(
-    (f): f is { subject: string; content: string } =>
-      typeof f?.subject === "string" && typeof f?.content === "string",
-  )
+  try {
+    const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
+    const parsed = JSON.parse(cleaned)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (f): f is { subject: string; content: string } =>
+        typeof f?.subject === "string" && typeof f?.content === "string",
+    )
+  } catch {
+    return []
+  }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -49,8 +59,10 @@ describe("parseFactsOutput (shared JSON parsing logic)", () => {
     expect(parseFactsOutput("{}")).toEqual([])
   })
 
-  test("throws on invalid JSON", () => {
-    expect(() => parseFactsOutput("not json")).toThrow()
+  test("returns [] for invalid JSON (matches production try/catch contract)", () => {
+    // Production adapter methods wrap JSON.parse in try/catch and return [].
+    // The helper mirrors that contract so tests stay aligned.
+    expect(parseFactsOutput("not json")).toEqual([])
   })
 
   test("filters out entries missing required fields", () => {
@@ -97,6 +109,14 @@ describe("LlmAdapter registration", () => {
       scope: "/test",
     })
     expect(result).toEqual([])
+  })
+
+  test("registerLlmAdapter registers a non-null adapter", () => {
+    registerLlmAdapter()
+    const adapter = llm.getLlmAdapter()
+    expect(adapter).not.toBeNull()
+    expect(typeof adapter?.extractFacts).toBe("function")
+    expect(typeof adapter?.reflect).toBe("function")
   })
 
   test("extractFromText returns [] for short text even with adapter", async () => {
