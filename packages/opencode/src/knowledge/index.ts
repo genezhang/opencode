@@ -36,8 +36,8 @@ export async function learnFact(input: {
   scope: KnowledgeScope
   subject: string
   content: string
-  sourceSession: SessionID
-  sourceTurn: MessageID
+  sourceSession?: SessionID // optional — null stored for synthetic entries (e.g. reflections)
+  sourceTurn?: MessageID
 }): Promise<{ id: string; isNew: boolean }> {
   const db = zengramDb()
   const now = Date.now() * 1000
@@ -50,7 +50,11 @@ export async function learnFact(input: {
     [input.projectId, input.scope, input.subject],
   )
   if (existing[0]) {
-    const isCrossSession = existing[0].source_session !== input.sourceSession
+    // Cross-session confirmation only fires when both sessions are known and distinct.
+    const isCrossSession =
+      input.sourceSession != null &&
+      existing[0].source_session != null &&
+      existing[0].source_session !== input.sourceSession
     if (isCrossSession) {
       // Cross-session confirmation: the same fact appeared independently in another
       // session — boost importance and confidence so it surfaces more in recall.
@@ -82,7 +86,7 @@ export async function learnFact(input: {
         status, importance, confidence, access_count, time_created, time_updated)
      VALUES ($1,$2,$3,$4,$5,'agent',$6,$7,'active',0.7,0.8,0,$8,$9)`,
     [id, input.projectId, input.scope, input.subject, input.content,
-     input.sourceSession, input.sourceTurn, now, now],
+     input.sourceSession ?? null, input.sourceTurn ?? null, now, now],
   )
   // Compute and store embedding server-side via Zeta's embed() function.
   // Fire-and-forget: embedding is best-effort; retrieval falls back to FTS if null.
@@ -356,7 +360,8 @@ export async function extractAndLearn(input: {
   log.info("passive extraction done", { turnId: input.turnId, stored })
 
   // After storing new facts, opportunistically synthesize higher-level patterns.
-  // Throttled internally to at most once per 6 hours — safe to call on every turn.
+  // reflectKnowledge() has its own minFacts guard (total active facts >= 5) and is
+  // throttled to once per 6 hours — safe to call fire-and-forget on every turn.
   if (stored > 0) {
     reflectKnowledge({ projectId: input.projectId })
       .catch((e) => log.warn("reflection failed", { err: e }))
@@ -516,6 +521,10 @@ export async function reflectKnowledge(input: {
   )
   if (rows.length < minFacts) return 0
 
+  // Mark as attempted before the LLM call so concurrent turns don't pile up
+  // and a model that repeatedly returns non-JSON doesn't spam on every turn.
+  _lastReflectRun.set(input.projectId, now)
+
   let insights: Array<{ subject: string; content: string }> = []
   try {
     const modelRef = await Provider.defaultModel()
@@ -546,7 +555,6 @@ export async function reflectKnowledge(input: {
     return 0
   }
 
-  _lastReflectRun.set(input.projectId, now)
   let stored = 0
   for (const insight of insights) {
     try {
@@ -555,8 +563,7 @@ export async function reflectKnowledge(input: {
         scope: "/project",
         subject: insight.subject,
         content: insight.content,
-        sourceSession: "reflection" as SessionID,
-        sourceTurn: "reflection" as MessageID,
+        // sourceSession/sourceTurn are omitted — reflection has no FK-valid origin.
       })
       if (isNew) stored++
     } catch (e) {
@@ -585,7 +592,12 @@ export async function recallWorkspaceContext(input: {
   limit?: number
 }): Promise<WorkspaceFileEntry[]> {
   const db = zengramDb()
-  const limit = Math.min(input.limit ?? 30, 100)
+  // Validate before interpolation (Zeta plan-cache bug requires LIMIT to be
+  // string-interpolated, not parameterized — so NaN/Infinity must be guarded).
+  const rawLimit = input.limit
+  const limit = Number.isFinite(rawLimit) && rawLimit! > 0
+    ? Math.min(Math.floor(rawLimit!), 100)
+    : 30
 
   return db.query<WorkspaceFileEntry>(
     `SELECT file_path, understanding, edit_state, relevance
@@ -605,24 +617,37 @@ export async function recallWorkspaceContext(input: {
  * Format workspace file context as a system-prompt block.
  * Returns null if no files have been touched.
  */
+/** Sanitize a file path for safe inclusion in an XML-like prompt block. */
+function sanitizePath(p: string): string {
+  return p.replace(/\n/g, " ").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
 export function formatWorkspaceBlock(files: WorkspaceFileEntry[]): string | null {
   if (files.length === 0) return null
 
   const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
-  const read = files.filter((f) => f.edit_state !== "modified" && f.edit_state !== "deleted")
+  const unmodified = files.filter((f) => f.edit_state !== "modified" && f.edit_state !== "deleted")
+  // Distinguish actually-read files from those only listed (e.g. directory scans).
+  const read   = unmodified.filter((f) => f.understanding === "deep" || f.understanding === "read")
+  const listed = unmodified.filter((f) => f.understanding === "listed")
 
   const lines: string[] = []
   if (modified.length > 0) {
     lines.push("Modified in this session:")
     for (const f of modified) {
       const tag = f.edit_state === "deleted" ? " (deleted)" : ""
-      lines.push(`  - ${f.file_path}${tag}`)
+      lines.push(`  - ${sanitizePath(f.file_path)}${tag}`)
     }
   }
   if (read.length > 0) {
     lines.push("Read in this session:")
-    for (const f of read.slice(0, 10)) lines.push(`  - ${f.file_path}`)
+    for (const f of read.slice(0, 10)) lines.push(`  - ${sanitizePath(f.file_path)}`)
+  }
+  if (listed.length > 0) {
+    lines.push("Directories listed in this session:")
+    for (const f of listed.slice(0, 5)) lines.push(`  - ${sanitizePath(f.file_path)}`)
   }
 
+  if (lines.length === 0) return null
   return `<zengram-workspace>\n${lines.join("\n")}\n</zengram-workspace>`
 }
