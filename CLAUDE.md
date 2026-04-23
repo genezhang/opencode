@@ -4,7 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenCode is an open-source AI-powered development tool (CLI, web, desktop). Monorepo using Bun workspaces and Turbo for orchestration.
+This repo is a **fork of [opencode](https://github.com/sst/opencode)**. Upstream OpenCode is an open-source AI-powered development tool (CLI, web, desktop) — a Bun/Turbo monorepo. We use it as a concrete testbed; our fork has a different mission.
+
+### Why this fork exists
+
+**Goal:** replace OpenCode's memory/storage layer (SQLite + Drizzle) with **Zengram**, a purpose-built agent database framework, to give agentic workflows a substrate that SQLite was never designed for (facts, knowledge, workspace context, recall, decay, cross-session continuity).
+
+Coding agents are the **first testbed** for Zengram, and OpenCode is the concrete repo where we prove it out end-to-end. See `memory/project_zengram.md` for design context.
+
+### Current status — honest
+
+We are **far from the goal**. Initial `zengram-bench` runs show Zengram-enabled sessions **burn more tokens without a quality gain** versus the SQLite baseline. The optimization target is clear:
+
+- **Reduce turns** required to complete a task.
+- **Reduce tokens** per turn (recall should pay for itself).
+- Match or beat the SQLite baseline's output quality.
+
+Improvements are needed on **both sides**:
+- **Zengram side** — better recall signal, cheaper queries, tighter prompts for reflection/extraction, less noise in workspace context.
+- **OpenCode side** — smarter injection of Zengram context (when to recall, how much to include, how to avoid re-sending stale facts), tool-call patterns that exploit persistent memory instead of re-deriving state.
+
+When proposing changes in this repo, ask: *does this move the turn count or token count in the right direction, and if not, what does it buy us?*
 
 ## Essential Commands
 
@@ -117,8 +137,16 @@ Husky pre-push hook verifies Bun version matches `package.json` and runs `bun ty
 
 ## Branch Convention
 
-- Default branch is `dev` (not `main`). Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
+This fork inverts upstream's branch layout:
+
+- **`origin/main` is our default branch.** PRs in this fork target `main`. Day-to-day work, diffs, and releases are all against `main`.
+- **`origin/dev` is the upstream tracking branch** (the default branch of `sst/opencode`). We pull from it to absorb upstream changes — but upstream merges frequently and **we do not try to keep up with every merge**. Sync from `dev` deliberately, not continuously.
+- When diffing "what changed in our fork," compare against **`origin/main`**, not `origin/dev`.
+- When diffing "what's new upstream that we haven't pulled," compare `origin/dev` against our last sync point.
+- Local `main` may be ahead of `origin/dev` by a large number of commits — that is expected, not a mistake.
 
 ## PR Conventions
 
-PR titles use conventional commits: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`. Optional scope: `feat(app):`, `fix(desktop):`.
+PR titles use conventional commits: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`. Optional scope: `feat(app):`, `fix(desktop):`, `feat(zengram):`.
+
+PRs target **`main`** (our fork's default), not `dev` (upstream).
