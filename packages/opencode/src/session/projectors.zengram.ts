@@ -269,8 +269,10 @@ export default [
           toolData.state?.input ?? {},
           toolData.state?.output ?? null,
           toolData.state?.error ?? null,
-          toolData.state?.time
-            ? Math.round((toolData.state.time.end ?? toolData.state.time.start) - toolData.state.time.start)
+          // Only report duration for terminal states; running tools only have
+          // time.start, so falling back to (end ?? start) silently stored 0.
+          toolData.state?.time?.start != null && toolData.state?.time?.end != null
+            ? Math.round(toolData.state.time.end - toolData.state.time.start)
             : null,
           0, // tokens_consumed
           now,

@@ -12,6 +12,7 @@ import * as zengramModule from "@/storage/db.zengram"
 import { Provider } from "@/provider/provider"
 import type { WorkspaceFileEntry, KnowledgeEntry } from "../../src/knowledge/index"
 import {
+  extractAndLearn,
   extractFacts,
   formatKnowledgeBlock,
   formatWorkspaceBlock,
@@ -372,5 +373,82 @@ describe("reflectKnowledge", () => {
     const result2 = await reflectKnowledge({ projectId, minFacts: 3 })
     expect(result2).toBe(0)
     expect(queryCalls).toBe(0)
+  })
+})
+
+// ── extractAndLearn — JSONB-string decoding (regression) ─────────────────────
+// Zeta returns JSONB columns as stringified JSON, not objects. The previous
+// version of extractAndLearn used that raw string as the fact-extraction
+// input, so extractFacts ran against `{"text":"..."}` scaffolding and found
+// nothing. This guards the `typeof p.data === "string" ? JSON.parse(...)`
+// decode path.
+describe("extractAndLearn (JSONB string decode)", () => {
+  test("parses stringified part.data and feeds the decoded .text to extractFacts", async () => {
+    // Concrete fact pattern that extractFacts picks up via the normative
+    // "always ..." heuristic; wrapped in JSONB-string form exactly as Zeta
+    // would return it.
+    const prose =
+      "Always use parameterized queries to prevent SQL injection attacks. " +
+      "Never concatenate user input directly into query strings — the cost " +
+      "of a single escape mistake is a full privilege escalation."
+    const stringified = JSON.stringify({ text: prose })
+
+    // Dispatch by SQL so the `part` and `knowledge` queries give different
+    // responses — the default single-slot fakeZengramClient can't distinguish.
+    let learnFactInserts = 0
+    const dispatchClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        if (sql.includes("FROM part")) {
+          return [{ data: stringified }] as any
+        }
+        return [] as any // learnFact's existing-check → empty → treat as new
+      },
+      execute: async (sql: string, _params?: unknown[]) => {
+        if (sql.startsWith("INSERT INTO knowledge")) learnFactInserts++
+        return 0
+      },
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+
+    const stored = await extractAndLearn({
+      projectId: "proj_test" as any,
+      sessionId: "ses_test" as any,
+      turnId: "msg_test" as any,
+    })
+
+    // At least one fact extracted from the decoded text AND persisted via
+    // learnFact. Before the fix both would be zero because extractFacts
+    // received the raw JSON scaffolding.
+    expect(stored).toBeGreaterThan(0)
+    expect(learnFactInserts).toBeGreaterThan(0)
+  })
+
+  test("raw-object part.data still works (no regression for object shape)", async () => {
+    // Defensive: if Zeta ever starts returning real objects (e.g. after the
+    // FFI-side fix in zeta-embedded#16 lands), the same extraction path must
+    // keep working.
+    const prose =
+      "Always validate schema versions before a destructive migration; " +
+      "the last time we skipped this it took production down for forty minutes."
+    let learnFactInserts = 0
+    const dispatchClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        if (sql.includes("FROM part")) return [{ data: { text: prose } }] as any
+        return [] as any
+      },
+      execute: async (sql: string, _params?: unknown[]) => {
+        if (sql.startsWith("INSERT INTO knowledge")) learnFactInserts++
+        return 0
+      },
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+
+    const stored = await extractAndLearn({
+      projectId: "proj_test" as any,
+      sessionId: "ses_test" as any,
+      turnId: "msg_test" as any,
+    })
+    expect(stored).toBeGreaterThan(0)
+    expect(learnFactInserts).toBeGreaterThan(0)
   })
 })
