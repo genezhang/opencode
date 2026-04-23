@@ -1515,15 +1515,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ])
                 const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
                 const workspaceBlock = formatWorkspaceBlock(workspaceFiles)
-                const system = [
+                // Collapse stable content (env + skills + instructions + any
+                // structured-output directive) into ONE system message so the
+                // first applyCaching breakpoint (`slice(0, 2)` in
+                // provider/transform.ts) covers the whole ~10-12K-token stable
+                // prefix. Zengram's workspace + knowledge blocks come after:
+                // when they mutate the cache up to the breakpoint still hits,
+                // so a workspace-block change no longer re-bills the entire
+                // prefix as uncached. Measured on dj-11740: cache-miss turns
+                // went from input≈12k+cacheRead≈2k to the full prefix staying
+                // cached across mutations.
+                const format = lastUser.format ?? { type: "text" as const }
+                const stableParts: string[] = [
                   ...env,
                   ...(skills ? [skills] : []),
                   ...instructions,
-                  ...(knowledgeBlock ? [knowledgeBlock] : []),
-                  ...(workspaceBlock ? [workspaceBlock] : []),
                 ]
-                const format = lastUser.format ?? { type: "text" as const }
-                if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+                if (format.type === "json_schema") stableParts.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+                const system: string[] = [stableParts.join("\n\n")]
+                const zengramBlock = [knowledgeBlock, workspaceBlock].filter(Boolean).join("\n\n")
+                if (zengramBlock) system.push(zengramBlock)
                 // dj-11740 instrumentation — tracks per-turn context-block sizes
                 // so the bench re-run can attribute the 2.02× prompt-token ratio.
                 // char→token uses the ~4 chars/token heuristic; good enough to
