@@ -13,8 +13,7 @@ import { Provider } from "../../src/provider/provider"
 import { Session } from "../../src/session"
 import type { SessionID } from "../../src/session/schema"
 import { ShareNext } from "../../src/share/share-next"
-import { SessionShareTable } from "../../src/share/share.sql"
-import { Database, eq } from "../../src/storage/db"
+import { zengramDb } from "../../src/storage/db.zengram"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import { testEffect } from "../lib/effect"
@@ -68,8 +67,13 @@ function wired(client: HttpClient.HttpClient) {
   )
 }
 
-const share = (id: SessionID) =>
-  Database.use((db) => db.select().from(SessionShareTable).where(eq(SessionShareTable.session_id, id)).get())
+async function share(id: SessionID) {
+  const rows = await zengramDb().query<{ id: string; url: string; secret: string }>(
+    `SELECT share_id AS id, url, secret FROM session_share WHERE session_id = $1`,
+    [id],
+  )
+  return rows[0]
+}
 
 const seed = (url: string, org?: string) =>
   AccountRepo.use((repo) =>
@@ -170,7 +174,7 @@ describe("ShareNext", () => {
           expect(result.url).toBe("https://legacy-share.example.com/share/abc")
           expect(result.secret).toBe("sec_123")
 
-          const row = share(session.id)
+          const row = yield* Effect.promise(() => share(session.id))
           expect(row?.id).toBe("shr_abc")
           expect(row?.url).toBe("https://legacy-share.example.com/share/abc")
           expect(row?.secret).toBe("sec_123")
@@ -208,7 +212,7 @@ describe("ShareNext", () => {
             yield* ShareNext.Service.use((svc) => svc.remove(session.id))
           }).pipe(Effect.provide(live(client)))
 
-          expect(share(session.id)).toBeUndefined()
+          expect(yield* Effect.promise(() => share(session.id))).toBeUndefined()
           expect(seen.map((req) => [req.method, req.url])).toEqual([
             ["POST", "https://legacy-share.example.com/api/share"],
             ["DELETE", "https://legacy-share.example.com/api/share/shr_abc"],
@@ -229,7 +233,7 @@ describe("ShareNext", () => {
         )
 
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(share(session.id)).toBeUndefined()
+        expect(yield* Effect.promise(() => share(session.id))).toBeUndefined()
       }),
     ),
   )
@@ -253,17 +257,11 @@ describe("ShareNext", () => {
           const info = yield* session.create({ title: "first" })
           yield* share.init()
           yield* Effect.sleep(50)
-          yield* Effect.sync(() =>
-            Database.use((db) =>
-              db
-                .insert(SessionShareTable)
-                .values({
-                  session_id: info.id,
-                  id: "shr_abc",
-                  url: "https://legacy-share.example.com/share/abc",
-                  secret: "sec_123",
-                })
-                .run(),
+          yield* Effect.promise(() =>
+            zengramDb().execute(
+              `INSERT INTO session_share (session_id, share_id, url, secret, time_created, time_updated)
+               VALUES ($1, $2, $3, $4, $5, $5)`,
+              [info.id, "shr_abc", "https://legacy-share.example.com/share/abc", "sec_123", Date.now()],
             ),
           )
 

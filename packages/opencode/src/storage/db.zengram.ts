@@ -120,15 +120,6 @@ export function zengramPool(): pg.Pool {
   return _pgClient.getPool()
 }
 
-/**
- * Zengram is enabled whenever the storage backend is not plain SQLite.
- * Embedded mode is the default; pgwire is opt-in via OPENCODE_STORAGE=pgwire.
- */
-export const ZENGRAM_ENABLED = process.env.OPENCODE_STORAGE !== "sqlite"
-
-/** True when running in pgwire (external server) mode. */
-export const PGWIRE_MODE = process.env.OPENCODE_STORAGE === "pgwire"
-
 /** Close the active connection (pgwire only; embedded is closed via GC). */
 export async function closeZengram(): Promise<void> {
   if (_pgClient) {

@@ -10,8 +10,8 @@ import { afterAll } from "bun:test"
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
 await fs.mkdir(dir, { recursive: true })
 afterAll(async () => {
-  const { Database } = await import("../src/storage/db")
-  Database.close()
+  const { closeZengram } = await import("../src/storage/db.zengram")
+  await closeZengram()
   const busy = (error: unknown) =>
     typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY"
   const rm = async (left: number): Promise<void> => {
@@ -24,8 +24,8 @@ afterAll(async () => {
     })
   }
 
-  // Windows can keep SQLite WAL handles alive until GC finalizers run, so we
-  // force GC and retry teardown to avoid flaky EBUSY in test cleanup.
+  // Force GC and retry teardown on Windows where file handles can linger
+  // briefly after close.
   await rm(30)
 })
 
@@ -74,17 +74,22 @@ delete process.env["SAMBANOVA_API_KEY"]
 delete process.env["OPENCODE_SERVER_PASSWORD"]
 delete process.env["OPENCODE_SERVER_USERNAME"]
 
-// Use in-memory sqlite
-process.env["OPENCODE_DB"] = ":memory:"
-
 // Now safe to import from src/
 const { Log } = await import("../src/util/log")
 const { initProjectors } = await import("../src/server/projectors")
+const { initEmbedded, rawEmbeddedDb } = await import("../src/storage/db.embedded")
+const { runEmbeddedMigrations } = await import("../src/storage/zengram-migrate")
 
 Log.init({
   print: false,
   dev: true,
   level: "DEBUG",
 })
+
+// Initialise embedded Zeta in :memory: mode so every if (ZENGRAM_ENABLED)
+// branch has a live client. Migrations run synchronously against the raw
+// NAPI handle — the schema is established before any test opens a transaction.
+initEmbedded(":memory:", "lsm")
+runEmbeddedMigrations(rawEmbeddedDb())
 
 initProjectors()

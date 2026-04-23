@@ -2,8 +2,6 @@ import type { Argv } from "yargs"
 import { cmd } from "./cmd"
 import { Session } from "../../session"
 import { bootstrap } from "../bootstrap"
-import { Database } from "../../storage/db"
-import { SessionTable } from "../../session/session.sql"
 import { Project } from "../../project/project"
 import { Instance } from "../../project/instance"
 
@@ -88,8 +86,11 @@ async function getCurrentProject(): Promise<Project.Info> {
 }
 
 async function getAllSessions(): Promise<Session.Info[]> {
-  const rows = Database.use((db) => db.select().from(SessionTable).all())
-  return rows.map((row) => Session.fromRow(row))
+  const all: Session.Info[] = []
+  for await (const item of Session.listGlobal({ archived: true, limit: 100000 })) {
+    all.push(item)
+  }
+  return all
 }
 
 export async function aggregateSessionStats(days?: number, projectFilter?: string): Promise<SessionStats> {

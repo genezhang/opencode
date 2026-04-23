@@ -5,7 +5,6 @@ import { SessionID, MessageID, PartID } from "@/session/schema"
 import z from "zod"
 import { Session } from "../../session"
 import { MessageV2 } from "../../session/message-v2"
-import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { SessionPrompt } from "../../session/prompt"
 import { SessionCompaction } from "../../session/compaction"
 import { SessionRevert } from "../../session/revert"
@@ -665,9 +664,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const params = c.req.valid("param")
-        const message = ZENGRAM_ENABLED
-          ? await MessageV2.zengramGet({ sessionID: params.sessionID, messageID: params.messageID })
-          : MessageV2.get({ sessionID: params.sessionID, messageID: params.messageID })
+        const message = await MessageV2.zengramGet({ sessionID: params.sessionID, messageID: params.messageID })
         return c.json(message)
       },
     )

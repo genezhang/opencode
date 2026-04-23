@@ -14,7 +14,6 @@ import { Installation } from "./installation"
 import { NamedError } from "@opencode-ai/util/error"
 import { FormatError } from "./cli/error"
 import { ServeCommand } from "./cli/cmd/serve"
-import { Filesystem } from "./util/filesystem"
 import { DebugCommand } from "./cli/cmd/debug"
 import { StatsCommand } from "./cli/cmd/stats"
 import { McpCommand } from "./cli/cmd/mcp"
@@ -28,18 +27,11 @@ import { EOL } from "os"
 import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
-import { DbCommand } from "./cli/cmd/db"
-import path from "path"
-import { Global } from "./global"
-import { JsonMigration } from "./storage/json-migration"
-import { Database } from "./storage/db"
 import { errorMessage } from "./util/error"
-import { ZENGRAM_ENABLED, initZengram, zengramPool, PGWIRE_MODE } from "./storage/db.zengram"
 import { initEmbedded, rawEmbeddedDb } from "./storage/db.embedded"
 import { backfillEmbeddings } from "./knowledge"
 import { registerLlmAdapter } from "./knowledge/adapter"
-import { ensureZeta } from "./storage/zeta-process"
-import { runMigrations, runEmbeddedMigrations } from "./storage/zengram-migrate"
+import { runEmbeddedMigrations } from "./storage/zengram-migrate"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
 
@@ -109,78 +101,27 @@ const cli = yargs(args)
     process.env.OPENCODE = "1"
     process.env.OPENCODE_PID = String(process.pid)
 
-    // Initialise Zengram storage backend.
-    // Default: embedded (in-process Zeta via NAPI — no subprocess, no port).
-    // OPENCODE_STORAGE=pgwire: subprocess Zeta + pgwire (legacy / server mode).
-    // OPENCODE_STORAGE=sqlite: skip Zengram entirely (plain SQLite only).
-    if (ZENGRAM_ENABLED) {
-      if (PGWIRE_MODE) {
-        // Legacy subprocess + pgwire path.
-        const zetaPort = await ensureZeta()
-        if (zetaPort !== null) process.env.ZENGRAM_PORT = String(zetaPort)
-        await initZengram()
-        await runMigrations(zengramPool())
-      } else {
-        // Embedded (default): open Zeta in-process, no subprocess needed.
-        const { ZETA_DATA_DIR } = await import("./storage/zeta-process")
-        const { mkdirSync } = await import("fs")
-        mkdirSync(ZETA_DATA_DIR, { recursive: true })
-        initEmbedded(ZETA_DATA_DIR, "lsm")
-        runEmbeddedMigrations(rawEmbeddedDb())
-      }
+    // Initialise Zengram storage backend (embedded: in-process Zeta via NAPI — no subprocess, no port).
+    const { ZETA_DATA_DIR } = await import("./storage/zeta-process")
+    const { mkdirSync } = await import("fs")
+    mkdirSync(ZETA_DATA_DIR, { recursive: true })
+    initEmbedded(ZETA_DATA_DIR, "lsm")
+    runEmbeddedMigrations(rawEmbeddedDb())
 
-      // Register OpenCode's AI provider as the Zengram LLM adapter (extraction + reflection).
-      registerLlmAdapter()
+    // Register OpenCode's AI provider as the Zengram LLM adapter (extraction + reflection).
+    registerLlmAdapter()
 
-      // Backfill embeddings for knowledge entries that predate embed() support.
-      // Fire-and-forget: embed() may not be available without libzeta_embed.a.
-      setTimeout(() => {
-        backfillEmbeddings()
-          .catch(() => {/* embed() not available — keyword search fallback is active */})
-      }, 10_000)
-    }
+    // Backfill embeddings for knowledge entries that predate embed() support.
+    // Fire-and-forget: embed() may not be available without libzeta_embed.a.
+    setTimeout(() => {
+      backfillEmbeddings()
+        .catch(() => {/* embed() not available — keyword search fallback is active */})
+    }, 10_000)
 
     Log.Default.info("opencode", {
       version: Installation.VERSION,
       args: process.argv.slice(2),
     })
-
-    const marker = path.join(Global.Path.data, "opencode.db")
-    if (!(await Filesystem.exists(marker))) {
-      const tty = process.stderr.isTTY
-      process.stderr.write("Performing one time database migration, may take a few minutes..." + EOL)
-      const width = 36
-      const orange = "\x1b[38;5;214m"
-      const muted = "\x1b[0;2m"
-      const reset = "\x1b[0m"
-      let last = -1
-      if (tty) process.stderr.write("\x1b[?25l")
-      try {
-        await JsonMigration.run(Database.Client().$client, {
-          progress: (event) => {
-            const percent = Math.floor((event.current / event.total) * 100)
-            if (percent === last && event.current !== event.total) return
-            last = percent
-            if (tty) {
-              const fill = Math.round((percent / 100) * width)
-              const bar = `${"■".repeat(fill)}${"･".repeat(width - fill)}`
-              process.stderr.write(
-                `\r${orange}${bar} ${percent.toString().padStart(3)}%${reset} ${muted}${event.label.padEnd(12)} ${event.current}/${event.total}${reset}`,
-              )
-              if (event.current === event.total) process.stderr.write("\n")
-            } else {
-              process.stderr.write(`sqlite-migration:${percent}${EOL}`)
-            }
-          },
-        })
-      } finally {
-        if (tty) process.stderr.write("\x1b[?25h")
-        else {
-          process.stderr.write(`sqlite-migration:done${EOL}`)
-        }
-      }
-      process.stderr.write("Database migration complete." + EOL)
-    }
   })
   .usage("")
   .completion("completion", "generate shell completion script")
@@ -206,7 +147,6 @@ const cli = yargs(args)
   .command(PrCommand)
   .command(SessionCommand)
   .command(PluginCommand)
-  .command(DbCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||
