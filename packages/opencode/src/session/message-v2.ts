@@ -820,8 +820,12 @@ export namespace MessageV2 {
 
   /** Reconstruct a MessageV2.Part from a Zengram part row. */
   function zengramPartToMessagePart(row: Record<string, any>): MessageV2.Part {
+    // Zeta returns JSONB columns as strings, not objects — spreading a string
+    // character-by-character silently drops the part's `type` and `text`
+    // fields. See the same guard on `permission_json` in session/zengram.ts.
+    const data = typeof row.data === "string" ? JSON.parse(row.data) : row.data ?? {}
     return {
-      ...(row.data ?? {}),
+      ...data,
       id: row.id as PartID,
       sessionID: row.session_id as SessionID,
       messageID: row.turn_id as MessageID,
