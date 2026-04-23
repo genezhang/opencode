@@ -237,11 +237,21 @@ export default [
       [id, messageID, sessionID, partType, dataWithoutId, position, now, now],
     )
 
-    // For tool parts, also maintain the tool_call table
+    // For tool parts, also maintain the tool_call table.
+    // ToolPart shape: { tool: string, state: { status, input, output?, error?, time? } }.
+    // The previous version read `toolData.toolName`, `toolData.state === "completed"`,
+    // and top-level `toolData.input/output/error/time`, which all missed — tool_call
+    // rows were stored with tool_id="unknown" + state="pending" forever, and the
+    // completed-branch that writes file_operation / workspace_file never ran, so
+    // recallWorkspaceContext returned [] on every turn.
     if (partType === "tool") {
       const toolData = restData as any
-      const state = toolData.state ?? "pending"
-      const toolState = state === "completed" ? "completed" : state === "error" ? "error" : state === "running" ? "running" : "pending"
+      const toolState = toolData.state?.status ?? "pending"
+      const toolStateStr =
+        toolState === "completed" ? "completed"
+        : toolState === "error"   ? "error"
+        : toolState === "running" ? "running"
+        : "pending"
 
       await db.execute(
         `INSERT INTO tool_call
@@ -254,23 +264,25 @@ export default [
            time_completed = EXCLUDED.time_completed`,
         [
           id, messageID, id, sessionID,
-          toolData.toolName ?? "unknown",
-          toolState,
-          toolData.input ?? {},
-          toolData.output ?? null,
-          toolData.error ?? null,
-          toolData.time ? Math.round((toolData.time.end ?? toolData.time.start) - toolData.time.start) : null,
+          toolData.tool ?? "unknown",
+          toolStateStr,
+          toolData.state?.input ?? {},
+          toolData.state?.output ?? null,
+          toolData.state?.error ?? null,
+          toolData.state?.time
+            ? Math.round((toolData.state.time.end ?? toolData.state.time.start) - toolData.state.time.start)
+            : null,
           0, // tokens_consumed
           now,
-          toolState === "completed" || toolState === "error" ? now : null,
+          toolStateStr === "completed" || toolStateStr === "error" ? now : null,
         ],
       )
 
       // Record file operations for completed file-touching tool calls.
-      if (toolState === "completed") {
+      if (toolStateStr === "completed") {
         // Normalize to lowercase: the LLM tool-call repair path lowercases names.
-        const toolName: string = (toolData.toolName ?? "").toLowerCase()
-        const input = (toolData.input ?? {}) as Record<string, unknown>
+        const toolName: string = (toolData.tool ?? "").toLowerCase()
+        const input = (toolData.state?.input ?? {}) as Record<string, unknown>
 
         const mapping = FILE_TOOLS[toolName]
         if (mapping) {
