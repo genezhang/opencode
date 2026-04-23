@@ -159,14 +159,24 @@ export const ImportCommand = cmd({
       })
       const db = zengramDb()
       const now = Date.now() * 1000
-      const branchId = randomUUID()
+
+      // If the session already exists, reuse its active_branch so imported
+      // turns/parts attach to the branch session.active_branch points at.
+      // Otherwise mint a new branch id and create the trunk branch below.
+      const existing = await db.query<{ active_branch: string }>(
+        `SELECT active_branch FROM session WHERE id = $1 LIMIT 1`,
+        [info.id],
+      )
+      const branchId = existing[0]?.active_branch ?? randomUUID()
 
       await db.execute(
         `INSERT INTO session
            (id, project_id, parent_id, title, slug, workspace_id, directory, version,
             permission_json, status, active_branch, time_created, time_updated)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$12)
-         ON CONFLICT (id) DO UPDATE SET project_id = EXCLUDED.project_id`,
+         ON CONFLICT (id) DO UPDATE SET
+           project_id = EXCLUDED.project_id,
+           time_updated = EXCLUDED.time_updated`,
         [
           info.id,
           info.projectID,

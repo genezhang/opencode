@@ -19,7 +19,6 @@ export namespace SyncEvent {
 
   export type Event<Def extends Definition = Definition> = {
     id: string
-    seq: number
     aggregateID: string
     data: z.infer<Def["schema"]>
   }
@@ -148,7 +147,7 @@ export namespace SyncEvent {
     }
 
     const id = EventID.ascending()
-    const event = { id, seq: 0, aggregateID: agg, data }
+    const event = { id, aggregateID: agg, data }
     return processAsync(def, event, { publish: true })
   }
 
