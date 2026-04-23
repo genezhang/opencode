@@ -1,18 +1,16 @@
 import z from "zod"
 import { setTimeout as sleep } from "node:timers/promises"
 import { fn } from "@/util/fn"
-import { Database, eq } from "@/storage/db"
 import { Project } from "@/project/project"
 import { BusEvent } from "@/bus/bus-event"
 import { GlobalBus } from "@/bus/global"
 import { Log } from "@/util/log"
 import { ProjectID } from "@/project/schema"
-import { WorkspaceTable } from "./workspace.sql"
 import { getAdaptor } from "./adaptors"
 import { WorkspaceInfo } from "./types"
 import { WorkspaceID } from "./schema"
 import { parseSSE } from "./sse"
-import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
+import { zengramDb } from "@/storage/db.zengram"
 
 export namespace Workspace {
   export const Event = {
@@ -34,18 +32,6 @@ export namespace Workspace {
     ref: "Workspace",
   })
   export type Info = z.infer<typeof Info>
-
-  function fromRow(row: typeof WorkspaceTable.$inferSelect): Info {
-    return {
-      id: row.id,
-      type: row.type,
-      branch: row.branch,
-      name: row.name,
-      directory: row.directory,
-      extra: row.extra,
-      projectID: row.project_id,
-    }
-  }
 
   const CreateInput = z.object({
     id: WorkspaceID.zod.optional(),
@@ -71,122 +57,85 @@ export namespace Workspace {
       projectID: input.projectID,
     }
 
-    if (ZENGRAM_ENABLED) {
-      const now = Date.now() * 1000
-      await zengramDb().execute(
-        `INSERT INTO workspace (id, project_id, type, branch, name, directory, extra, time_created, time_updated)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [
-          info.id, info.projectID, info.type, info.branch ?? null, info.name ?? null,
-          info.directory ?? null, info.extra ? JSON.stringify(info.extra) : null, now, now,
-        ],
-      )
-    } else {
-      Database.use((db) => {
-        db.insert(WorkspaceTable)
-          .values({
-            id: info.id,
-            type: info.type,
-            branch: info.branch,
-            name: info.name,
-            directory: info.directory,
-            extra: info.extra,
-            project_id: info.projectID,
-          })
-          .run()
-      })
-    }
+    const now = Date.now() * 1000
+    await zengramDb().execute(
+      `INSERT INTO workspace (id, project_id, type, branch, name, directory, extra, time_created, time_updated)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        info.id, info.projectID, info.type, info.branch ?? null, info.name ?? null,
+        info.directory ?? null, info.extra ? JSON.stringify(info.extra) : null, now, now,
+      ],
+    )
 
     await adaptor.create(config)
     return info
   })
 
   export async function list(project: Project.Info): Promise<Info[]> {
-    if (ZENGRAM_ENABLED) {
-      const rows = await zengramDb().query<{
-        id: string; project_id: string; type: string; branch: string | null
-        name: string | null; directory: string | null; extra: unknown
-      }>(
-        `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE project_id = $1`,
-        [project.id],
-      )
-      return rows
-        .map((row) => ({
-          id: row.id as WorkspaceID & string,
-          type: row.type as Info["type"],
-          branch: row.branch ?? null,
-          name: row.name ?? null,
-          directory: row.directory ?? null,
-          extra: row.extra as Info["extra"],
-          projectID: row.project_id as ProjectID & string,
-        }))
-        .sort((a, b) => a.id.localeCompare(b.id))
-    }
-    const rows = Database.use((db) =>
-      db.select().from(WorkspaceTable).where(eq(WorkspaceTable.project_id, project.id)).all(),
+    const rows = await zengramDb().query<{
+      id: string; project_id: string; type: string; branch: string | null
+      name: string | null; directory: string | null; extra: unknown
+    }>(
+      `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE project_id = $1`,
+      [project.id],
     )
-    return rows.map(fromRow).sort((a, b) => a.id.localeCompare(b.id))
+    return rows
+      .map((row) => ({
+        id: row.id as WorkspaceID & string,
+        type: row.type as Info["type"],
+        branch: row.branch ?? null,
+        name: row.name ?? null,
+        directory: row.directory ?? null,
+        extra: row.extra as Info["extra"],
+        projectID: row.project_id as ProjectID & string,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id))
   }
 
   export const get = fn(WorkspaceID.zod, async (id) => {
-    if (ZENGRAM_ENABLED) {
-      const rows = await zengramDb().query<{
-        id: string; project_id: string; type: string; branch: string | null
-        name: string | null; directory: string | null; extra: unknown
-      }>(
-        `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE id = $1`,
-        [id],
-      )
-      if (!rows[0]) return undefined
-      const row = rows[0]
-      return {
-        id: row.id as WorkspaceID & string,
-        type: row.type as Info["type"],
-        branch: row.branch ?? null,
-        name: row.name ?? null,
-        directory: row.directory ?? null,
-        extra: row.extra as Info["extra"],
-        projectID: row.project_id as ProjectID & string,
-      }
+    const rows = await zengramDb().query<{
+      id: string; project_id: string; type: string; branch: string | null
+      name: string | null; directory: string | null; extra: unknown
+    }>(
+      `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE id = $1`,
+      [id],
+    )
+    if (!rows[0]) return undefined
+    const row = rows[0]
+    return {
+      id: row.id as WorkspaceID & string,
+      type: row.type as Info["type"],
+      branch: row.branch ?? null,
+      name: row.name ?? null,
+      directory: row.directory ?? null,
+      extra: row.extra as Info["extra"],
+      projectID: row.project_id as ProjectID & string,
     }
-    const row = Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
-    if (!row) return
-    return fromRow(row)
   })
 
   export const remove = fn(WorkspaceID.zod, async (id) => {
-    if (ZENGRAM_ENABLED) {
-      const rows = await zengramDb().query<{
-        id: string; project_id: string; type: string; branch: string | null
-        name: string | null; directory: string | null; extra: unknown
-      }>(
-        `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE id = $1`,
-        [id],
-      )
-      if (!rows[0]) return undefined
-      const row = rows[0]
-      const info: Info = {
-        id: row.id as WorkspaceID & string,
-        type: row.type as Info["type"],
-        branch: row.branch ?? null,
-        name: row.name ?? null,
-        directory: row.directory ?? null,
-        extra: row.extra as Info["extra"],
-        projectID: row.project_id as ProjectID & string,
-      }
-      const adaptor = await getAdaptor(row.type)
-      adaptor.remove(info)
-      await zengramDb().execute(`DELETE FROM workspace WHERE id = $1`, [id])
-      return info
+    const rows = await zengramDb().query<{
+      id: string; project_id: string; type: string; branch: string | null
+      name: string | null; directory: string | null; extra: unknown
+    }>(
+      `SELECT id, project_id, type, branch, name, directory, extra FROM workspace WHERE id = $1`,
+      [id],
+    )
+    if (!rows[0]) return undefined
+    const row = rows[0]
+    const info: Info = {
+      id: row.id as WorkspaceID & string,
+      type: row.type as Info["type"],
+      branch: row.branch ?? null,
+      name: row.name ?? null,
+      directory: row.directory ?? null,
+      extra: row.extra as Info["extra"],
+      projectID: row.project_id as ProjectID & string,
     }
-    const row = Database.use((db) => db.select().from(WorkspaceTable).where(eq(WorkspaceTable.id, id)).get())
-    if (row) {
-      const info = fromRow(row)
-      const adaptor = await getAdaptor(row.type)
-      adaptor.remove(info)
-      Database.use((db) => db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, id)).run())
-      return info
-    }
+    const adaptor = await getAdaptor(row.type)
+    adaptor.remove(info)
+    await zengramDb().execute(`DELETE FROM workspace WHERE id = $1`, [id])
+    return info
   })
   const log = Log.create({ service: "workspace-sync" })
 

@@ -360,7 +360,6 @@
         "cross-spawn": "catalog:",
         "decimal.js": "10.5.0",
         "diff": "catalog:",
-        "drizzle-orm": "catalog:",
         "effect": "catalog:",
         "fuzzysort": "3.1.0",
         "gitlab-ai-provider": "6.0.0",
@@ -424,8 +423,6 @@
         "@types/which": "3.0.4",
         "@types/yargs": "17.0.33",
         "@typescript/native-preview": "catalog:",
-        "drizzle-kit": "catalog:",
-        "drizzle-orm": "catalog:",
         "typescript": "catalog:",
         "vscode-languageserver-types": "3.17.5",
         "why-is-node-running": "3.2.2",
@@ -3264,7 +3261,7 @@
 
     "get-tsconfig": ["get-tsconfig@4.13.7", "", { "dependencies": { "resolve-pkg-maps": "^1.0.0" } }, "sha512-7tN6rFgBlMgpBML5j8typ92BKFi2sFQvIdpAqLA2beia5avZDrMs0FLZiM5etShWq5irVyGcGMEA1jcDaK7A/Q=="],
 
-    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#4af877d", {}, "anomalyco-ghostty-web-4af877d", "sha512-fbEK8mtr7ar4ySsF+JUGjhaZrane7dKphanN+SxHt5XXI6yLMAh/Hpf6sNCOyyVa2UlGCd7YpXG/T2v2RUAX+A=="],
+    "ghostty-web": ["ghostty-web@github:anomalyco/ghostty-web#20bd361", {}, "anomalyco-ghostty-web-20bd361", "sha512-dW0nwaiBBcun9y5WJSvm3HxDLe5o9V0xLCndQvWonRVubU8CS1PHxZpLffyPt1YujPWC13ez03aWxcuKBPYYGQ=="],
 
     "gifwrap": ["gifwrap@0.10.1", "", { "dependencies": { "image-q": "^4.0.0", "omggif": "^1.0.10" } }, "sha512-2760b1vpJHNmLzZ/ubTtNnEx5WApN/PYWJvXvgS+tL1egTTthayFYIQQNi136FLEDcN/IyEY2EcGpIITD6eYUw=="],
 

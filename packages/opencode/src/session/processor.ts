@@ -10,7 +10,6 @@ import { Log } from "@/util/log"
 import { Session } from "."
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
-import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
@@ -185,11 +184,7 @@ export namespace SessionProcessor {
                 metadata: value.providerMetadata,
               } satisfies MessageV2.ToolPart)
 
-              const parts = yield* Effect.promise(async () =>
-                ZENGRAM_ENABLED
-                  ? MessageV2.zengramParts(ctx.assistantMessage.id)
-                  : MessageV2.parts(ctx.assistantMessage.id),
-              )
+              const parts = yield* Effect.promise(() => MessageV2.zengramParts(ctx.assistantMessage.id))
               const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
 
               if (
@@ -401,11 +396,7 @@ export namespace SessionProcessor {
           }
           ctx.reasoningMap = {}
 
-          const parts = yield* Effect.promise(async () =>
-            ZENGRAM_ENABLED
-              ? MessageV2.zengramParts(ctx.assistantMessage.id)
-              : MessageV2.parts(ctx.assistantMessage.id),
-          )
+          const parts = yield* Effect.promise(() => MessageV2.zengramParts(ctx.assistantMessage.id))
           for (const part of parts) {
             if (part.type !== "tool" || part.state.status === "completed" || part.state.status === "error") continue
             yield* session.updatePart({

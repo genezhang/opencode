@@ -4,8 +4,6 @@ import { Global } from "../global"
 import { Instance } from "../project/instance"
 import { InstanceBootstrap } from "../project/bootstrap"
 import { Project } from "../project/project"
-import { Database, eq } from "../storage/db"
-import { ProjectTable } from "../project/project.sql"
 import type { ProjectID } from "../project/schema"
 import { Log } from "../util/log"
 import { Slug } from "@opencode-ai/util/slug"
@@ -456,10 +454,7 @@ export namespace Worktree {
         directory: string,
         input: { projectID: ProjectID; extra?: string },
       ) {
-        const row = yield* Effect.sync(() =>
-          Database.use((db) => db.select().from(ProjectTable).where(eq(ProjectTable.id, input.projectID)).get()),
-        )
-        const project = row ? Project.fromRow(row) : undefined
+        const project = yield* Effect.promise(() => Project.get(input.projectID))
         const startup = project?.commands?.start?.trim() ?? ""
         const ok = yield* runStartScript(directory, startup, "project")
         if (!ok) return false

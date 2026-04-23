@@ -1,13 +1,9 @@
 import z from "zod"
 import type { ZodObject } from "zod"
 import { EventEmitter } from "events"
-import { Database, eq } from "@/storage/db"
 import { Bus as ProjectBus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
-import { EventSequenceTable, EventTable } from "./event.sql"
 import { EventID } from "./schema"
-import { Flag } from "@/flag/flag"
-import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 
 export namespace SyncEvent {
   export type Definition = {
@@ -23,20 +19,16 @@ export namespace SyncEvent {
 
   export type Event<Def extends Definition = Definition> = {
     id: string
-    seq: number
     aggregateID: string
     data: z.infer<Def["schema"]>
   }
 
   export type SerializedEvent<Def extends Definition = Definition> = Event<Def> & { type: string }
 
-  // SQLite projector (synchronous, receives a Drizzle tx)
-  type SyncProjectorFunc = (db: Database.TxOrDb, data: unknown) => void
   // Zengram projector (async, no db parameter needed)
   type AsyncProjectorFunc = (data: unknown) => Promise<void>
 
   export const registry = new Map<string, Definition>()
-  let syncProjectors: Map<Definition, SyncProjectorFunc> | undefined
   let asyncProjectors: Map<Definition, AsyncProjectorFunc> | undefined
   const versions = new Map<string, number>()
   let frozen = false
@@ -46,20 +38,14 @@ export namespace SyncEvent {
 
   export function reset() {
     frozen = false
-    syncProjectors = undefined
     asyncProjectors = undefined
     convertEvent = (_, data) => data
   }
 
   export function init(input: {
-    syncProjectors?: Array<[Definition, SyncProjectorFunc]>
     asyncProjectors?: Array<[Definition, AsyncProjectorFunc]>
-    /** Combined list (legacy signature, treated as sync) */
-    projectors?: Array<[Definition, SyncProjectorFunc]>
     convertEvent?: typeof convertEvent
   }) {
-    if (input.syncProjectors) syncProjectors = new Map(input.syncProjectors)
-    else if (input.projectors) syncProjectors = new Map(input.projectors)
     if (input.asyncProjectors) asyncProjectors = new Map(input.asyncProjectors)
 
     // Install all the latest event defs to the bus. We only ever emit
@@ -107,16 +93,6 @@ export namespace SyncEvent {
   }
 
   /**
-   * Register a synchronous SQLite projector (receives a Drizzle tx).
-   */
-  export function project<Def extends Definition>(
-    def: Def,
-    func: (db: Database.TxOrDb, data: Event<Def>["data"]) => void,
-  ): [Definition, SyncProjectorFunc] {
-    return [def, func as SyncProjectorFunc]
-  }
-
-  /**
    * Register an async projector for Zengram storage backend.
    */
   export function projectAsync<Def extends Definition>(
@@ -154,67 +130,9 @@ export namespace SyncEvent {
     publishEvent(def, event, options)
   }
 
-  // ── SQLite sync path (unchanged from original) ────────────────────────────
-
-  function processSync<Def extends Definition>(def: Def, event: Event<Def>, options: { publish: boolean }) {
-    if (syncProjectors == null) {
-      throw new Error("No sync projectors available. Call `SyncEvent.init` with syncProjectors")
-    }
-    const projector = syncProjectors.get(def)
-    if (!projector) throw new Error(`Projector not found for event: ${def.type}`)
-
-    Database.transaction((tx) => {
-      projector(tx, event.data)
-
-      if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
-        tx.insert(EventSequenceTable)
-          .values({ aggregate_id: event.aggregateID, seq: event.seq })
-          .onConflictDoUpdate({ target: EventSequenceTable.aggregate_id, set: { seq: event.seq } })
-          .run()
-        tx.insert(EventTable)
-          .values({
-            id: event.id, seq: event.seq,
-            aggregate_id: event.aggregateID,
-            type: versionedType(def.type, def.version),
-            data: event.data as Record<string, unknown>,
-          })
-          .run()
-      }
-
-      Database.effect(() => publishEvent(def, event, options))
-    })
-  }
-
-  // TODO:
-  //
-  // * Support applying multiple events at one time. One transaction,
-  //   and it validets all the sequence ids
-  // * when loading events from db, apply zod validation to ensure shape
-
   export async function replay(event: SerializedEvent, options?: { republish: boolean }) {
     const def = registry.get(event.type)
     if (!def) throw new Error(`Unknown event type: ${event.type}`)
-
-    if (!ZENGRAM_ENABLED) {
-      const row = Database.use((db) =>
-        db
-          .select({ seq: EventSequenceTable.seq })
-          .from(EventSequenceTable)
-          .where(eq(EventSequenceTable.aggregate_id, event.aggregateID))
-          .get(),
-      )
-      const latest = row?.seq ?? -1
-      if (event.seq <= latest) return
-      const expected = latest + 1
-      if (event.seq !== expected) {
-        throw new Error(
-          `Sequence mismatch for aggregate "${event.aggregateID}": expected ${expected}, got ${event.seq}`,
-        )
-      }
-      processSync(def, event, { publish: !!options?.republish })
-      return
-    }
-
     await processAsync(def, event, { publish: !!options?.republish })
   }
 
@@ -228,42 +146,13 @@ export namespace SyncEvent {
       throw new Error(`SyncEvent.run: running old versions of events is not allowed: ${def.type}`)
     }
 
-    if (ZENGRAM_ENABLED) {
-      const id = EventID.ascending()
-      const event = { id, seq: 0, aggregateID: agg, data }
-      return processAsync(def, event, { publish: true })
-    }
-
-    // SQLite: run synchronously inside immediate transaction
-    return new Promise<void>((resolve, reject) => {
-      try {
-        Database.transaction(
-          (tx) => {
-            const id = EventID.ascending()
-            const row = tx
-              .select({ seq: EventSequenceTable.seq })
-              .from(EventSequenceTable)
-              .where(eq(EventSequenceTable.aggregate_id, agg))
-              .get()
-            const seq = row?.seq != null ? row.seq + 1 : 0
-            const event = { id, seq, aggregateID: agg, data }
-            processSync(def, event, { publish: true })
-          },
-          { behavior: "immediate" },
-        )
-        resolve()
-      } catch (e) {
-        reject(e)
-      }
-    })
+    const id = EventID.ascending()
+    const event = { id, aggregateID: agg, data }
+    return processAsync(def, event, { publish: true })
   }
 
-  export function remove(aggregateID: string) {
-    if (ZENGRAM_ENABLED) return // event log is SQLite-only
-    Database.transaction((tx) => {
-      tx.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
-      tx.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-    })
+  export function remove(_aggregateID: string) {
+    // Event log lives in Zengram; no cleanup needed here.
   }
 
   export function subscribeAll(handler: (event: { def: Definition; event: Event }) => void) {

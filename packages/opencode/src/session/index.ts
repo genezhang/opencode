@@ -9,12 +9,8 @@ import { Config } from "../config/config"
 import { Flag } from "../flag/flag"
 import { Installation } from "../installation"
 
-import { Database, NotFoundError, eq, and, gte, isNull, desc, like, inArray, lt } from "../storage/db"
+import { NotFoundError } from "../storage/errors"
 import { SyncEvent } from "../sync"
-import type { SQL } from "../storage/db"
-import { SessionTable } from "./session.sql"
-import { ProjectTable } from "../project/project.sql"
-import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { zengramGetSession, zengramGetChildren, zengramListSessions, zengramListSessionsGlobal, zengramGetProjectSummaries } from "./zengram"
 import { Storage } from "@/storage/storage"
 import { Log } from "../util/log"
@@ -52,66 +48,6 @@ export namespace Session {
     return new RegExp(
       `^(${parentTitlePrefix}|${childTitlePrefix})\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$`,
     ).test(title)
-  }
-
-  type SessionRow = typeof SessionTable.$inferSelect
-
-  export function fromRow(row: SessionRow): Info {
-    const summary =
-      row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
-        ? {
-            additions: row.summary_additions ?? 0,
-            deletions: row.summary_deletions ?? 0,
-            files: row.summary_files ?? 0,
-            diffs: row.summary_diffs ?? undefined,
-          }
-        : undefined
-    const share = row.share_url ? { url: row.share_url } : undefined
-    const revert = row.revert ?? undefined
-    return {
-      id: row.id,
-      slug: row.slug,
-      projectID: row.project_id,
-      workspaceID: row.workspace_id ?? undefined,
-      directory: row.directory,
-      parentID: row.parent_id ?? undefined,
-      title: row.title,
-      version: row.version,
-      summary,
-      share,
-      revert,
-      permission: row.permission ?? undefined,
-      time: {
-        created: row.time_created,
-        updated: row.time_updated,
-        compacting: row.time_compacting ?? undefined,
-        archived: row.time_archived ?? undefined,
-      },
-    }
-  }
-
-  export function toRow(info: Info) {
-    return {
-      id: info.id,
-      project_id: info.projectID,
-      workspace_id: info.workspaceID,
-      parent_id: info.parentID,
-      slug: info.slug,
-      directory: info.directory,
-      title: info.title,
-      version: info.version,
-      share_url: info.share?.url,
-      summary_additions: info.summary?.additions,
-      summary_deletions: info.summary?.deletions,
-      summary_files: info.summary?.files,
-      summary_diffs: info.summary?.diffs,
-      revert: info.revert ?? null,
-      permission: info.permission,
-      time_created: info.time.created,
-      time_updated: info.time.updated,
-      time_compacting: info.time.compacting,
-      time_archived: info.time.archived,
-    }
   }
 
   function getForkedTitle(title: string): string {
@@ -367,9 +303,6 @@ export namespace Session {
 
   type Patch = z.infer<typeof Event.Updated.schema>["info"]
 
-  const db = <T>(fn: (d: Parameters<typeof Database.use>[0] extends (trx: infer D) => any ? D : never) => T) =>
-    Effect.sync(() => Database.use(fn))
-
   export const layer: Layer.Layer<Service, never, Bus.Service | Config.Service> = Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -423,14 +356,9 @@ export namespace Session {
       })
 
       const get = Effect.fn("Session.get")(function* (id: SessionID) {
-        if (ZENGRAM_ENABLED) {
-          const info = yield* Effect.promise(() => zengramGetSession(id))
-          if (!info) throw new NotFoundError({ message: `Session not found: ${id}` })
-          return info
-        }
-        const row = yield* db((d) => d.select().from(SessionTable).where(eq(SessionTable.id, id)).get())
-        if (!row) throw new NotFoundError({ message: `Session not found: ${id}` })
-        return fromRow(row)
+        const info = yield* Effect.promise(() => zengramGetSession(id))
+        if (!info) throw new NotFoundError({ message: `Session not found: ${id}` })
+        return info
       })
 
       const share = Effect.fn("Session.share")(function* (id: SessionID) {
@@ -454,17 +382,7 @@ export namespace Session {
 
       const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
         const ctx = yield* InstanceState.context
-        if (ZENGRAM_ENABLED) {
-          return yield* Effect.promise(() => zengramGetChildren(ctx.project.id, parentID))
-        }
-        const rows = yield* db((d) =>
-          d
-            .select()
-            .from(SessionTable)
-            .where(and(eq(SessionTable.project_id, ctx.project.id), eq(SessionTable.parent_id, parentID)))
-            .all(),
-        )
-        return rows.map(fromRow)
+        return yield* Effect.promise(() => zengramGetChildren(ctx.project.id, parentID))
       })
 
       const remove: (sessionID: SessionID) => Effect.Effect<void> = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -603,25 +521,19 @@ export namespace Session {
       })
 
       const messages = Effect.fn("Session.messages")(function* (input: { sessionID: SessionID; limit?: number }) {
-        if (ZENGRAM_ENABLED) {
-          if (input.limit) {
-            const result = yield* Effect.promise(() =>
-              MessageV2.zengramPage({ sessionID: input.sessionID, limit: input.limit! }),
-            )
-            return result.items
-          }
-          return yield* Effect.promise(async () => {
-            const items: MessageV2.WithParts[] = []
-            for await (const msg of MessageV2.zengramStream(input.sessionID)) {
-              items.push(msg)
-            }
-            return items.reverse()
-          })
-        }
         if (input.limit) {
-          return MessageV2.page({ sessionID: input.sessionID, limit: input.limit! }).items
+          const result = yield* Effect.promise(() =>
+            MessageV2.zengramPage({ sessionID: input.sessionID, limit: input.limit! }),
+          )
+          return result.items
         }
-        return Array.from(MessageV2.stream(input.sessionID)).reverse()
+        return yield* Effect.promise(async () => {
+          const items: MessageV2.WithParts[] = []
+          for await (const msg of MessageV2.zengramStream(input.sessionID)) {
+            items.push(msg)
+          }
+          return items.reverse()
+        })
       })
 
       const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
@@ -770,54 +682,17 @@ export namespace Session {
     limit?: number
   }) {
     const project = Instance.project
-
-    if (ZENGRAM_ENABLED) {
-      const sessions = await zengramListSessions({
-        projectId: project.id,
-        workspaceID: input?.workspaceID,
-        directory: input?.directory,
-        excludeChildren: input?.roots,
-        since: input?.start,
-        search: input?.search,
-        includeArchived: true,
-        limit: input?.limit ?? 100,
-      })
-      for (const s of sessions) yield s
-      return
-    }
-
-    const conditions = [eq(SessionTable.project_id, project.id)]
-
-    if (input?.workspaceID) {
-      conditions.push(eq(SessionTable.workspace_id, input.workspaceID))
-    }
-    if (input?.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
-    }
-    if (input?.roots) {
-      conditions.push(isNull(SessionTable.parent_id))
-    }
-    if (input?.start) {
-      conditions.push(gte(SessionTable.time_updated, input.start))
-    }
-    if (input?.search) {
-      conditions.push(like(SessionTable.title, `%${input.search}%`))
-    }
-
-    const limit = input?.limit ?? 100
-
-    const rows = Database.use((db) =>
-      db
-        .select()
-        .from(SessionTable)
-        .where(and(...conditions))
-        .orderBy(desc(SessionTable.time_updated))
-        .limit(limit)
-        .all(),
-    )
-    for (const row of rows) {
-      yield fromRow(row)
-    }
+    const sessions = await zengramListSessions({
+      projectId: project.id,
+      workspaceID: input?.workspaceID,
+      directory: input?.directory,
+      excludeChildren: input?.roots,
+      since: input?.start,
+      search: input?.search,
+      includeArchived: true,
+      limit: input?.limit ?? 100,
+    })
+    for (const s of sessions) yield s
   }
 
   export async function* listGlobal(input?: {
@@ -829,83 +704,26 @@ export namespace Session {
     limit?: number
     archived?: boolean
   }) {
-    if (ZENGRAM_ENABLED) {
-      const sessions = await zengramListSessionsGlobal({
-        directory: input?.directory,
-        excludeChildren: input?.roots,
-        since: input?.start,
-        before: input?.cursor,
-        search: input?.search,
-        includeArchived: !!input?.archived,
-        limit: input?.limit ?? 100,
-      })
-      const projectIds = [...new Set(sessions.map((s) => s.projectID))]
-      const projectRows = await zengramGetProjectSummaries(projectIds)
-      const projectMap = new Map(projectRows.map((p) => [p.id, p]))
-      for (const s of sessions) {
-        const proj = projectMap.get(s.projectID) ?? null
-        yield { ...s, project: proj ? { id: proj.id as ProjectID, name: proj.name ?? undefined, worktree: proj.worktree } : null }
-      }
-      return
-    }
-
-    const conditions: SQL[] = []
-
-    if (input?.directory) {
-      conditions.push(eq(SessionTable.directory, input.directory))
-    }
-    if (input?.roots) {
-      conditions.push(isNull(SessionTable.parent_id))
-    }
-    if (input?.start) {
-      conditions.push(gte(SessionTable.time_updated, input.start))
-    }
-    if (input?.cursor) {
-      conditions.push(lt(SessionTable.time_updated, input.cursor))
-    }
-    if (input?.search) {
-      conditions.push(like(SessionTable.title, `%${input.search}%`))
-    }
-    if (!input?.archived) {
-      conditions.push(isNull(SessionTable.time_archived))
-    }
-
-    const limit = input?.limit ?? 100
-
-    const rows = Database.use((db) => {
-      const query =
-        conditions.length > 0
-          ? db
-              .select()
-              .from(SessionTable)
-              .where(and(...conditions))
-          : db.select().from(SessionTable)
-      return query.orderBy(desc(SessionTable.time_updated), desc(SessionTable.id)).limit(limit).all()
+    const sessions = await zengramListSessionsGlobal({
+      directory: input?.directory,
+      excludeChildren: input?.roots,
+      since: input?.start,
+      before: input?.cursor,
+      search: input?.search,
+      includeArchived: !!input?.archived,
+      limit: input?.limit ?? 100,
     })
-
-    const ids = [...new Set(rows.map((row) => row.project_id))]
-    const projects = new Map<string, ProjectInfo>()
-
-    if (ids.length > 0) {
-      const items = Database.use((db) =>
-        db
-          .select({ id: ProjectTable.id, name: ProjectTable.name, worktree: ProjectTable.worktree })
-          .from(ProjectTable)
-          .where(inArray(ProjectTable.id, ids))
-          .all(),
-      )
-      for (const item of items) {
-        projects.set(item.id, {
-          id: item.id,
-          name: item.name ?? undefined,
-          worktree: item.worktree,
-        })
+    const projectIds = [...new Set(sessions.map((s) => s.projectID))]
+    const projectRows = await zengramGetProjectSummaries(projectIds)
+    const projectMap = new Map(projectRows.map((p) => [p.id, p]))
+    for (const s of sessions) {
+      const proj = projectMap.get(s.projectID) ?? null
+      yield {
+        ...s,
+        project: proj
+          ? { id: proj.id as ProjectID, name: proj.name ?? undefined, worktree: proj.worktree }
+          : null,
       }
-    }
-
-    for (const row of rows) {
-      const project = projects.get(row.project_id) ?? null
-      yield { ...fromRow(row), project }
     }
   }
 

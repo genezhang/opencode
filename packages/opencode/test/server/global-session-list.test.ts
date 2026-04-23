@@ -27,8 +27,8 @@ describe("Session.listGlobal", () => {
     expect(ids).toContain(firstSession.id)
     expect(ids).toContain(secondSession.id)
 
-    const firstProject = Project.get(firstSession.projectID)
-    const secondProject = Project.get(secondSession.projectID)
+    const firstProject = await Project.get(firstSession.projectID)
+    const secondProject = await Project.get(secondSession.projectID)
 
     const firstItem = sessions.find((session) => session.id === firstSession.id)
     const secondItem = sessions.find((session) => session.id === secondSession.id)

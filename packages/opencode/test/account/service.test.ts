@@ -5,14 +5,14 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { AccountRepo } from "../../src/account/repo"
 import { Account } from "../../src/account"
 import { AccessToken, AccountID, DeviceCode, Login, Org, OrgID, RefreshToken, UserCode } from "../../src/account/schema"
-import { Database } from "../../src/storage/db"
+import { zengramDb } from "../../src/storage/db.zengram"
 import { testEffect } from "../lib/effect"
 
 const truncate = Layer.effectDiscard(
-  Effect.sync(() => {
-    const db = Database.Client()
-    db.run(/*sql*/ `DELETE FROM account_state`)
-    db.run(/*sql*/ `DELETE FROM account`)
+  Effect.promise(async () => {
+    const db = zengramDb()
+    await db.execute(`DELETE FROM account_state`, [])
+    await db.execute(`DELETE FROM account`, [])
   }),
 )
 

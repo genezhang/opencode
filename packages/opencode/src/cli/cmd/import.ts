@@ -4,12 +4,12 @@ import { Session } from "../../session"
 import { MessageV2 } from "../../session/message-v2"
 import { cmd } from "./cmd"
 import { bootstrap } from "../bootstrap"
-import { Database } from "../../storage/db"
-import { SessionTable, MessageTable, PartTable } from "../../session/session.sql"
+import { zengramDb } from "../../storage/db.zengram"
 import { Instance } from "../../project/instance"
 import { ShareNext } from "../../share/share-next"
 import { EOL } from "os"
 import { Filesystem } from "../../util/filesystem"
+import { randomUUID } from "node:crypto"
 
 /** Discriminated union returned by the ShareNext API (GET /api/shares/:id/data) */
 export type ShareData =
@@ -157,45 +157,97 @@ export const ImportCommand = cmd({
         ...exportData.info,
         projectID: Instance.project.id,
       })
-      const row = Session.toRow(info)
-      Database.use((db) =>
-        db
-          .insert(SessionTable)
-          .values(row)
-          .onConflictDoUpdate({ target: SessionTable.id, set: { project_id: row.project_id } })
-          .run(),
+      const db = zengramDb()
+      const now = Date.now() * 1000
+
+      // If the session already exists, reuse its active_branch so imported
+      // turns/parts attach to the branch session.active_branch points at.
+      // Otherwise mint a new branch id and create the trunk branch below.
+      const existing = await db.query<{ active_branch: string }>(
+        `SELECT active_branch FROM session WHERE id = $1 LIMIT 1`,
+        [info.id],
+      )
+      const branchId = existing[0]?.active_branch ?? randomUUID()
+
+      await db.execute(
+        `INSERT INTO session
+           (id, project_id, parent_id, title, slug, workspace_id, directory, version,
+            permission_json, status, active_branch, time_created, time_updated)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11,$12)
+         ON CONFLICT (id) DO UPDATE SET
+           project_id = EXCLUDED.project_id,
+           time_updated = EXCLUDED.time_updated`,
+        [
+          info.id,
+          info.projectID,
+          info.parentID ?? null,
+          info.title,
+          info.slug,
+          info.workspaceID ?? null,
+          info.directory,
+          info.version ?? null,
+          info.permission ? JSON.stringify(info.permission) : null,
+          branchId,
+          (info.time.created ?? Date.now()) * 1000,
+          (info.time.updated ?? Date.now()) * 1000,
+        ],
+      )
+
+      await db.execute(
+        `INSERT INTO branch (id, session_id, name, status, time_created, time_updated)
+         VALUES ($1,$2,'trunk','active',$3,$4)
+         ON CONFLICT (id) DO NOTHING`,
+        [branchId, info.id, now, now],
       )
 
       for (const msg of exportData.messages) {
         const msgInfo = MessageV2.Info.parse(msg.info)
-        const { id, sessionID: _, ...msgData } = msgInfo
-        Database.use((db) =>
-          db
-            .insert(MessageTable)
-            .values({
-              id,
-              session_id: row.id,
-              time_created: msgInfo.time?.created ?? Date.now(),
-              data: msgData,
-            })
-            .onConflictDoNothing()
-            .run(),
+        const role = (msgInfo as any).role ?? "user"
+        const agent = (msgInfo as any).agent ?? null
+        const modelId = (msgInfo as any).modelID ?? (msgInfo as any).model?.modelID ?? null
+        const providerId = (msgInfo as any).providerID ?? (msgInfo as any).model?.providerID ?? null
+        const tokens = (msgInfo as any).tokens ?? {}
+        const timeCreated = (msgInfo.time?.created ?? Date.now()) * 1000
+        const timeCompleted = (msgInfo as any).time?.completed
+          ? (msgInfo as any).time.completed * 1000
+          : null
+
+        await db.execute(
+          `INSERT INTO turn
+             (id, session_id, branch_id, role, agent, model_id, provider_id,
+              tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+              cost_usd, finish_reason, status, tier, time_created, time_completed)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active','hot',$15,$16)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            msgInfo.id,
+            info.id,
+            branchId,
+            role,
+            agent,
+            modelId,
+            providerId,
+            tokens.input ?? 0,
+            tokens.output ?? 0,
+            tokens.reasoning ?? 0,
+            tokens.cache?.read ?? 0,
+            tokens.cache?.write ?? 0,
+            (msgInfo as any).cost ?? 0,
+            (msgInfo as any).finish ?? null,
+            timeCreated,
+            timeCompleted,
+          ],
         )
 
+        let position = 0
         for (const part of msg.parts) {
           const partInfo = MessageV2.Part.parse(part)
           const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
-          Database.use((db) =>
-            db
-              .insert(PartTable)
-              .values({
-                id: partId,
-                message_id: messageID,
-                session_id: row.id,
-                data: partData,
-              })
-              .onConflictDoNothing()
-              .run(),
+          await db.execute(
+            `INSERT INTO part (id, turn_id, session_id, type, data, position, time_created, time_updated)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT (id) DO NOTHING`,
+            [partId, messageID, info.id, partInfo.type, partData, position++, timeCreated, timeCreated],
           )
         }
       }

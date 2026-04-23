@@ -4,9 +4,7 @@ import { makeRuntime } from "@/effect/run-service"
 import { SessionID } from "./schema"
 import { Effect, Layer, ServiceMap } from "effect"
 import z from "zod"
-import { Database, eq, asc } from "../storage/db"
-import { TodoTable } from "./session.sql"
-import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
+import { zengramDb } from "@/storage/db.zengram"
 
 export namespace Todo {
   export const Info = z
@@ -41,74 +39,36 @@ export namespace Todo {
       const bus = yield* Bus.Service
 
       const update = Effect.fn("Todo.update")(function* (input: { sessionID: SessionID; todos: Info[] }) {
-        if (ZENGRAM_ENABLED) {
-          yield* Effect.promise(async () => {
-            const db = zengramDb()
-            // Replace all tasks for this session: delete then insert
-            await db.execute(`DELETE FROM task WHERE session_id = $1`, [input.sessionID])
-            const now = Date.now() * 1000
-            for (let i = 0; i < input.todos.length; i++) {
-              const todo = input.todos[i]!
-              const id = `${input.sessionID}:${i}`
-              await db.execute(
-                `INSERT INTO task (id, session_id, title, status, priority, time_created)
-                 VALUES ($1,$2,$3,$4,$5,$6)`,
-                [id, input.sessionID, todo.content, todo.status, todo.priority, now],
-              )
-            }
-          })
-        } else {
-          yield* Effect.sync(() =>
-            Database.transaction((db) => {
-              db.delete(TodoTable).where(eq(TodoTable.session_id, input.sessionID)).run()
-              if (input.todos.length === 0) return
-              db.insert(TodoTable)
-                .values(
-                  input.todos.map((todo, position) => ({
-                    session_id: input.sessionID,
-                    content: todo.content,
-                    status: todo.status,
-                    priority: todo.priority,
-                    position,
-                  })),
-                )
-                .run()
-            }),
-          )
-        }
+        yield* Effect.promise(async () => {
+          const db = zengramDb()
+          await db.execute(`DELETE FROM task WHERE session_id = $1`, [input.sessionID])
+          const now = Date.now() * 1000
+          for (let i = 0; i < input.todos.length; i++) {
+            const todo = input.todos[i]!
+            const id = `${input.sessionID}:${i}`
+            await db.execute(
+              `INSERT INTO task (id, session_id, title, status, priority, time_created)
+               VALUES ($1,$2,$3,$4,$5,$6)`,
+              [id, input.sessionID, todo.content, todo.status, todo.priority, now],
+            )
+          }
+        })
         yield* bus.publish(Event.Updated, input)
       })
 
       const get = Effect.fn("Todo.get")(function* (sessionID: SessionID) {
-        if (ZENGRAM_ENABLED) {
-          return yield* Effect.promise(async () => {
-            const db = zengramDb()
-            const rows = await db.query<{ title: string; status: string; priority: string }>(
-              `SELECT title, status, priority FROM task WHERE session_id = $1 ORDER BY time_created ASC`,
-              [sessionID],
-            )
-            return rows.map((row) => ({
-              content: row.title,
-              status: row.status,
-              priority: row.priority,
-            }))
-          })
-        }
-        const rows = yield* Effect.sync(() =>
-          Database.use((db) =>
-            db
-              .select()
-              .from(TodoTable)
-              .where(eq(TodoTable.session_id, sessionID))
-              .orderBy(asc(TodoTable.position))
-              .all(),
-          ),
-        )
-        return rows.map((row) => ({
-          content: row.content,
-          status: row.status,
-          priority: row.priority,
-        }))
+        return yield* Effect.promise(async () => {
+          const db = zengramDb()
+          const rows = await db.query<{ title: string; status: string; priority: string }>(
+            `SELECT title, status, priority FROM task WHERE session_id = $1 ORDER BY time_created ASC`,
+            [sessionID],
+          )
+          return rows.map((row) => ({
+            content: row.title,
+            status: row.status,
+            priority: row.priority,
+          }))
+        })
       })
 
       return Service.of({ update, get })

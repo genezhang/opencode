@@ -6,10 +6,8 @@ import { makeRuntime } from "@/effect/run-service"
 import { ProjectID } from "@/project/schema"
 import { Instance } from "@/project/instance"
 import { MessageID, SessionID } from "@/session/schema"
-import { PermissionTable } from "@/session/session.sql"
-import { Database, eq } from "@/storage/db"
 import { Log } from "@/util/log"
-import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
+import { zengramDb } from "@/storage/db.zengram"
 import { Wildcard } from "@/util/wildcard"
 import { Deferred, Effect, Layer, Schema, ServiceMap } from "effect"
 import os from "os"
@@ -144,26 +142,20 @@ export namespace Permission {
       const bus = yield* Bus.Service
       const state = yield* InstanceState.make<State>(
         Effect.fn("Permission.state")(function* (ctx) {
-          let approvedRules: Ruleset
-          if (ZENGRAM_ENABLED) {
-            approvedRules = yield* Effect.promise(() =>
-              zengramDb().query<{ permission: string; pattern: string; action: string }>(
+          const approvedRules: Ruleset = yield* Effect.promise(() =>
+            zengramDb()
+              .query<{ permission: string; pattern: string; action: string }>(
                 `SELECT permission, pattern, action FROM permission_rule WHERE project_id = $1`,
                 [ctx.project.id],
-              ).then((rows) =>
+              )
+              .then((rows) =>
                 rows.map((r) => ({
                   permission: r.permission,
                   pattern: r.pattern,
                   action: Rule.shape.action.parse(r.action),
                 })),
               ),
-            )
-          } else {
-            const row = Database.use((db) =>
-              db.select().from(PermissionTable).where(eq(PermissionTable.project_id, ctx.project.id)).get(),
-            )
-            approvedRules = row?.data ?? []
-          }
+          )
           const state = {
             pending: new Map<PermissionID, PendingEntry>(),
             approved: approvedRules,

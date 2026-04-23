@@ -51,12 +51,14 @@ let _db: Database | null = null
  *                 a transient in-process database (tests / CI).
  * @param mode     Storage engine — "lsm" (default) or "btree".
  */
-export function initEmbedded(dataDir: string, mode: zetaDb.StorageMode = "lsm"): void {
+export function initEmbedded(dataDir: string, mode: "lsm" | "btree" = "lsm"): void {
   if (_db) return
 
   log.info("opening embedded zeta", { dataDir, mode })
-  _db = dataDir === ":memory:" ? zetaDb.open(":memory:") : zetaDb.open(dataDir, mode)
-  setZengramClient(new EmbeddedClient(_db))
+  const db = dataDir === ":memory:" ? zetaDb.open(":memory:") : zetaDb.open(dataDir, mode)
+  if (!db) throw new Error(`zetaDb.open failed for ${dataDir}`)
+  _db = db
+  setZengramClient(new EmbeddedClient(db))
   log.info("embedded zeta ready")
 }
 

@@ -42,7 +42,6 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
-import { ZENGRAM_ENABLED } from "@/storage/db.zengram"
 import { recallFacts, formatKnowledgeBlock, recallWorkspaceContext, formatWorkspaceBlock } from "@/knowledge"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
@@ -1505,18 +1504,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   Effect.promise(() => SystemPrompt.environment(model)),
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
-                  ZENGRAM_ENABLED
-                    ? Effect.promise(() => {
-                        const userText = lastUserMsg?.parts
-                          .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
-                          .map((p) => p.text)
-                          .join(" ")
-                        return recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined })
-                      })
-                    : Effect.succeed([]),
-                  ZENGRAM_ENABLED
-                    ? Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID }))
-                    : Effect.succeed([]),
+                  Effect.promise(() => {
+                    const userText = lastUserMsg?.parts
+                      .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
+                      .map((p) => p.text)
+                      .join(" ")
+                    return recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined })
+                  }),
+                  Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID })),
                 ])
                 const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
                 const workspaceBlock = formatWorkspaceBlock(workspaceFiles)

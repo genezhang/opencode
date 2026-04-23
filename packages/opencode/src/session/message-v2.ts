@@ -1,14 +1,13 @@
 import { BusEvent } from "@/bus/bus-event"
 import { SessionID, MessageID, PartID } from "./schema"
-import { ZENGRAM_ENABLED, zengramDb } from "@/storage/db.zengram"
+import { zengramDb } from "@/storage/db.zengram"
 import z from "zod"
 import { NamedError } from "@opencode-ai/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { LSP } from "../lsp"
 import { Snapshot } from "@/snapshot"
 import { SyncEvent } from "../sync"
-import { Database, NotFoundError, and, desc, eq, inArray, lt, or } from "@/storage/db"
-import { MessageTable, PartTable, SessionTable } from "./session.sql"
+import { NotFoundError } from "@/storage/errors"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -527,53 +526,6 @@ export namespace MessageV2 {
     },
   }
 
-  const info = (row: typeof MessageTable.$inferSelect) =>
-    ({
-      ...row.data,
-      id: row.id,
-      sessionID: row.session_id,
-    }) as MessageV2.Info
-
-  const part = (row: typeof PartTable.$inferSelect) =>
-    ({
-      ...row.data,
-      id: row.id,
-      sessionID: row.session_id,
-      messageID: row.message_id,
-    }) as MessageV2.Part
-
-  const older = (row: Cursor) =>
-    or(
-      lt(MessageTable.time_created, row.time),
-      and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)),
-    )
-
-  function hydrate(rows: (typeof MessageTable.$inferSelect)[]) {
-    const ids = rows.map((row) => row.id)
-    const partByMessage = new Map<string, MessageV2.Part[]>()
-    if (ids.length > 0) {
-      const partRows = Database.use((db) =>
-        db
-          .select()
-          .from(PartTable)
-          .where(inArray(PartTable.message_id, ids))
-          .orderBy(PartTable.message_id, PartTable.id)
-          .all(),
-      )
-      for (const row of partRows) {
-        const next = part(row)
-        const list = partByMessage.get(row.message_id)
-        if (list) list.push(next)
-        else partByMessage.set(row.message_id, [next])
-      }
-    }
-
-    return rows.map((row) => ({
-      info: info(row),
-      parts: partByMessage.get(row.id) ?? [],
-    }))
-  }
-
   export const toModelMessagesEffect = Effect.fnUntraced(function* (
     input: WithParts[],
     model: Provider.Model,
@@ -877,20 +829,21 @@ export namespace MessageV2 {
   }
 
   /** Fetch messages with their parts from Zengram. */
-  export async function zengramPage(input: {
+  export async function page(input: {
     sessionID: SessionID
     limit: number
-    before?: { id: string; time: number }
+    before?: string
   }): Promise<{ items: WithParts[]; more: boolean; cursor?: string }> {
     const db = zengramDb()
+    const before = input.before ? cursor.decode(input.before) : undefined
     const conditions: string[] = ["session_id = $1"]
     const params: unknown[] = [input.sessionID]
     let idx = 2
 
-    if (input.before) {
+    if (before) {
       conditions.push(`(time_created < $${idx++} OR (time_created = $${idx++} AND id < $${idx++}))`)
-      const timeMicros = input.before.time * 1000
-      params.push(timeMicros, timeMicros, input.before.id)
+      const timeMicros = before.time * 1000
+      params.push(timeMicros, timeMicros, before.id)
     }
 
     // Zeta bug: parameterized LIMIT corrupts pg wire response — use literal integer
@@ -904,6 +857,12 @@ export namespace MessageV2 {
        LIMIT ${fetchLimit}`,
       params,
     )
+
+    if (turnRows.length === 0) {
+      const sessionRows = await db.query<{ id: string }>(`SELECT id FROM session WHERE id = $1`, [input.sessionID])
+      if (!sessionRows[0]) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
+      return { items: [] as MessageV2.WithParts[], more: false }
+    }
 
     const more = turnRows.length > input.limit
     const slice = more ? turnRows.slice(0, input.limit) : turnRows
@@ -941,64 +900,11 @@ export namespace MessageV2 {
     }
   }
 
-  export async function* zengramStream(sessionID: SessionID) {
-    const size = 50
-    let before: { id: string; time: number } | undefined
-    while (true) {
-      const next = await zengramPage({ sessionID, limit: size, before })
-      if (next.items.length === 0) break
-      for (let i = next.items.length - 1; i >= 0; i--) {
-        yield next.items[i]!
-      }
-      if (!next.more || !next.cursor) break
-      before = cursor.decode(next.cursor)
-    }
-  }
-
-  // ── end Zengram helpers ───────────────────────────────────────────────────
-
-  export function page(input: { sessionID: SessionID; limit: number; before?: string }) {
-    const before = input.before ? cursor.decode(input.before) : undefined
-    const where = before
-      ? and(eq(MessageTable.session_id, input.sessionID), older(before))
-      : eq(MessageTable.session_id, input.sessionID)
-    const rows = Database.use((db) =>
-      db
-        .select()
-        .from(MessageTable)
-        .where(where)
-        .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
-        .limit(input.limit + 1)
-        .all(),
-    )
-    if (rows.length === 0) {
-      const row = Database.use((db) =>
-        db.select({ id: SessionTable.id }).from(SessionTable).where(eq(SessionTable.id, input.sessionID)).get(),
-      )
-      if (!row) throw new NotFoundError({ message: `Session not found: ${input.sessionID}` })
-      return {
-        items: [] as MessageV2.WithParts[],
-        more: false,
-      }
-    }
-
-    const more = rows.length > input.limit
-    const slice = more ? rows.slice(0, input.limit) : rows
-    const items = hydrate(slice)
-    items.reverse()
-    const tail = slice.at(-1)
-    return {
-      items,
-      more,
-      cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
-    }
-  }
-
-  export function* stream(sessionID: SessionID) {
+  export async function* stream(sessionID: SessionID) {
     const size = 50
     let before: string | undefined
     while (true) {
-      const next = page({ sessionID, limit: size, before })
+      const next = await page({ sessionID, limit: size, before })
       if (next.items.length === 0) break
       for (let i = next.items.length - 1; i >= 0; i--) {
         yield next.items[i]!
@@ -1008,23 +914,10 @@ export namespace MessageV2 {
     }
   }
 
-  export function parts(message_id: MessageID): MessageV2.Part[] {
-    const rows = Database.use((db) =>
-      db.select().from(PartTable).where(eq(PartTable.message_id, message_id)).orderBy(PartTable.id).all(),
-    )
-    return rows.map(
-      (row) =>
-        ({
-          ...row.data,
-          id: row.id,
-          sessionID: row.session_id,
-          messageID: row.message_id,
-        }) as MessageV2.Part,
-    )
-  }
+  // ── end Zengram helpers ───────────────────────────────────────────────────
 
-  /** Zengram-backend parts reader (async). Used from Effect/async callers when ZENGRAM_ENABLED. */
-  export async function zengramParts(message_id: MessageID): Promise<MessageV2.Part[]> {
+  /** Zengram-backend parts reader (async). Used from Effect/async callers against the embedded Zengram store. */
+  export async function parts(message_id: MessageID): Promise<MessageV2.Part[]> {
     const db = zengramDb()
     const rows = await db.query<Record<string, any>>(
       `SELECT id, turn_id, session_id, type, data, position FROM part WHERE turn_id = $1 ORDER BY position ASC`,
@@ -1033,23 +926,8 @@ export namespace MessageV2 {
     return rows.map((row) => zengramPartToMessagePart(row))
   }
 
-  export function get(input: { sessionID: SessionID; messageID: MessageID }): WithParts {
-    const row = Database.use((db) =>
-      db
-        .select()
-        .from(MessageTable)
-        .where(and(eq(MessageTable.id, input.messageID), eq(MessageTable.session_id, input.sessionID)))
-        .get(),
-    )
-    if (!row) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
-    return {
-      info: info(row),
-      parts: parts(input.messageID),
-    }
-  }
-
-  /** Zengram-backend message getter (async). Used from async callers when ZENGRAM_ENABLED. */
-  export async function zengramGet(input: { sessionID: SessionID; messageID: MessageID }): Promise<WithParts> {
+  /** Zengram-backend message getter (async). */
+  export async function get(input: { sessionID: SessionID; messageID: MessageID }): Promise<WithParts> {
     const db = zengramDb()
     const turnRows = await db.query<Record<string, any>>(
       `SELECT id, session_id, role, agent, model_id, provider_id,
@@ -1059,8 +937,14 @@ export namespace MessageV2 {
       [input.messageID, input.sessionID],
     )
     if (!turnRows[0]) throw new NotFoundError({ message: `Message not found: ${input.messageID}` })
-    return { info: turnToInfo(turnRows[0]), parts: await zengramParts(input.messageID) }
+    return { info: turnToInfo(turnRows[0]), parts: await parts(input.messageID) }
   }
+
+  // Legacy aliases — preserved for existing callers that import zengram-prefixed names.
+  export const zengramPage = page
+  export const zengramStream = stream
+  export const zengramParts = parts
+  export const zengramGet = get
 
   export function filterCompacted(msgs: Iterable<MessageV2.WithParts>) {
     const result = [] as MessageV2.WithParts[]
