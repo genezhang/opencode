@@ -1522,12 +1522,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   ...(knowledgeBlock ? [knowledgeBlock] : []),
                   ...(workspaceBlock ? [workspaceBlock] : []),
                 ]
+                const format = lastUser.format ?? { type: "text" as const }
+                if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
                 // dj-11740 instrumentation — tracks per-turn context-block sizes
                 // so the bench re-run can attribute the 2.02× prompt-token ratio.
                 // char→token uses the ~4 chars/token heuristic; good enough to
-                // compare turns within one session. Toggle with
-                // OPENCODE_LOG_CONTEXT_SIZES=1.
-                if (process.env["OPENCODE_LOG_CONTEXT_SIZES"]) {
+                // compare turns within one session. Logged after any
+                // STRUCTURED_OUTPUT_SYSTEM_PROMPT push so systemChars reflects
+                // what actually goes over the wire.
+                if (Flag.OPENCODE_LOG_CONTEXT_SIZES) {
                   const wsChars = workspaceBlock?.length ?? 0
                   const kbChars = knowledgeBlock?.length ?? 0
                   const sysChars = system.reduce((n, s) => n + s.length, 0)
@@ -1544,8 +1547,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     systemTokensEst: Math.ceil(sysChars / 4),
                   })
                 }
-                const format = lastUser.format ?? { type: "text" as const }
-                if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
                 const result = yield* handle.process({
                   user: lastUser,
                   agent,

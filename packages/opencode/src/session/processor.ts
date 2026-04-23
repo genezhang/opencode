@@ -3,6 +3,7 @@ import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Bus } from "@/bus"
 import { Config } from "@/config/config"
+import { Flag } from "@/flag/flag"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
@@ -274,9 +275,8 @@ export namespace SessionProcessor {
               ctx.assistantMessage.cost += usage.cost
               ctx.assistantMessage.tokens = usage.tokens
               // dj-11740 instrumentation — pairs with context.sizes in prompt.ts
-              // to reveal how much of the input was served from cache. Toggle
-              // with OPENCODE_LOG_CONTEXT_SIZES=1.
-              if (globalThis.process.env["OPENCODE_LOG_CONTEXT_SIZES"]) {
+              // to reveal how much of the input was served from cache.
+              if (Flag.OPENCODE_LOG_CONTEXT_SIZES) {
                 log.info("step.usage", {
                   sessionID: ctx.sessionID,
                   messageID: ctx.assistantMessage.id,
