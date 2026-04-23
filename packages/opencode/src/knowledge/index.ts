@@ -316,13 +316,19 @@ export async function extractAndLearn(input: {
 }): Promise<number> {
   const db = zengramDb()
 
-  // Gather text from all text-type parts for this turn
+  // Gather text from all text-type parts for this turn. Zeta returns JSONB
+  // columns as stringified JSON, so we always parse and read the `.text`
+  // field — using the raw JSON string as "text" made extractFacts run
+  // against JSON scaffolding instead of the model's prose.
   const parts = await db.query<{ data: any }>(
     `SELECT data FROM part WHERE turn_id = $1 AND type = 'text' ORDER BY position ASC`,
     [input.turnId],
   )
   const fullText = parts
-    .map((p) => (typeof p.data === "string" ? p.data : (p.data as any)?.text ?? ""))
+    .map((p) => {
+      const data = typeof p.data === "string" ? JSON.parse(p.data) : p.data
+      return (data as { text?: string } | null)?.text ?? ""
+    })
     .join("\n")
     .trim()
 
