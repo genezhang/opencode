@@ -7,32 +7,56 @@ elevation or rule something out.
 
 ---
 
-## Status snapshot (post-2026-04-24)
+## Status snapshot (post-2026-04-24, late night)
 
-**Correction 2026-04-24 evening:** the first set of numbers recorded here for
-the plays feature (26 → 16 turns) came from a misconfigured bench adapter
-that was running the stale upstream opencode (`~/.opencode/bin/opencode`,
-March build), not our fork. `run-zengram.sh` defaulted
-`OPENCODE_ZENGRAM_BIN` to the literal string `opencode`, which the harness
-resolved via PATH to the wrong binary. Fixed upstream in zengram-bench#2 (now
-defaults to the sibling `opencode-fork.sh`). Honest re-run below.
+**This section has been corrected twice. Current honest state follows.** See
+the "invalidated results" note at the bottom of this section for history.
 
-| axis | 2026-04-09 zengram (pre-fix, also stale upstream) | after #11/#12/#13 (solo, verified fork) | **after #15 (plays, multi-session, verified fork)** |
+| axis | 2026-04-09 zengram (pre-fix) | after #11/#12/#13 (solo, verified fork) | after #15+#18 (plays, multi-session, verified fork) |
 |---|---|---|---|
-| dj-11740 prompt tokens (rep 0) | 80,388 | 26,436 | 112,261 |
-| dj-11740 prompt tokens (rep 2) | — | — | **63,258** (-44% vs rep 1) |
-| dj-11740 turns (rep 0) | 31 | 30 | 30 (cap) |
-| dj-11740 turns (rep 2) | — | — | **19** (-37% vs rep 1 cap) |
+| dj-11740 prompt tokens (rep 0) | 80,388 | 26,436 | ~77,464 |
+| dj-11740 turns (rep 0) | 31 | 30 | 21 |
+| dj-11740 turns (rep 2) | 31 (isolated) | — | 15 |
 | completion rate | 100% | 100% | 100% |
 
-**Result after honest re-run:** the fork injects heavier system prompts than
-stale upstream (plays + knowledge + workspace blocks), so rep 0 cost is
-higher (112K prompt tokens) and it often hits the 30-turn cap on fresh
-state. But accumulated plays do deliver: by rep 2 with two prior plays
-converging on `autodetector.py`, the model completes in 19 turns and 63K
-prompt tokens. That's a real 37% turn-count compounding win and a 64%
-prompt-token reduction — smaller than the invalid 26 → 16 number suggested,
-still genuinely validating the thesis.
+**Honest interpretation:** we have not yet validated Zengram's compounding
+value. The rep 2 turn drop (21 → 15) sits inside dj-11740's natural n=1
+variance band (2026-04-09 isolated reps: 12, 30, 31). The recall pipeline's
+**semantic path is silently dead** (see below), so no play has ever actually
+surfaced to the model during a bench run. Every "validation" so far has
+either been stale-upstream variance or fork-variance-with-broken-recall.
+
+### Why recall has been silently broken
+
+1. **Zeta JOIN drops columns from aliased rows** (upstream bug,
+   zeta-embedded#17). `SELECT p.data FROM part p JOIN turn t ON ...` reads
+   `row.data` as undefined because the projected key is `"p.data"`, not
+   bare `data`. This made `recordPlay` early-return every call before PR
+   #18 worked around it with two sequential queries.
+2. **Zeta `embed()` silently returns NULL** (upstream bug, zeta-embedded#18).
+   `SELECT embed('hello')` returns NULL, doesn't throw. So
+   `UPDATE knowledge SET embedding = embed(subject || '. ' || content)`
+   leaves `embedding` NULL. `recallPlays` filters `WHERE embedding IS NOT
+   NULL` → zero rows. `recallFacts` has the same dead vector branch.
+   Likely root cause: NAPI binding not linked against `libzeta_embed.a`
+   (local-embed feature) in the current build. Needs zeta-side
+   investigation or a rebuild with the right feature flag.
+
+Until embed() returns real vectors, plays can persist (PR #18 confirmed) but
+can never be recalled. Turn reductions, if any, are variance.
+
+### Invalidated results (kept for history)
+
+- **"26 → 16 turns" (2026-04-23):** ran against the stale upstream opencode,
+  not our fork. `run-zengram.sh` defaulted `OPENCODE_ZENGRAM_BIN` to PATH's
+  `opencode`. Fixed in zengram-bench#2.
+- **"30 → 30 → 19 turns" (2026-04-24 morning, honest re-run against fork):**
+  hit the JOIN bug (#18) and embed() NULL bug (#18-upstream), so `recordPlay`
+  never wrote rows and recall was never attempted. The 19-turn outcome was
+  pure task variance.
+- **"21 → 21 → 15 turns" (2026-04-24 late night, post-#18):** plays persist
+  but embeddings stay NULL → `recallPlays` returned empty on every logged
+  turn (verified: `plays=0` on all context.sizes lines). Still variance.
 
 ### Fixes that got us here
 - [#11](https://github.com/genezhang/opencode/pull/11) — JSONB string decode on `part.data`. Sessions couldn't complete a single real turn before this.
@@ -59,11 +83,11 @@ still genuinely validating the thesis.
 
 ### B. Turns-side (the harder, higher-value direction)
 
-**B1. Multi-session bench methodology.** ✅ **Validated with plays (2026-04-24, honest re-run).** Harness landed in zengram-bench#1. The initial "26 → 26 → 16" result from the bench was invalid (stale upstream binary via PATH; see zengram-bench#2 for the adapter default fix). Honest re-run against the fork: **30 → 30 → 19 turns** across 3 reps of dj-11740 multi-session — rep 0 and 1 hit the 30-turn cap because fresh/sparse plays don't yet shortcut, rep 2 drops to 19 once two converging plays point at the same file. Thesis still validated, magnitude smaller than the invalid numbers suggested: 37% turn reduction + 64% prompt-token reduction between rep 1 and rep 2.
+**B1. Multi-session bench methodology.** Harness landed (zengram-bench#1). **Thesis not yet validated** — multiple "validation" runs (26/26/16, 30/30/19, 21/21/15 across 2026-04-23/24) turned out to be one of: wrong binary, JOIN-bug-broken recordPlay, or NULL-embedding-broken recall. See the "Invalidated results" note at the top of this doc. Blocked on zeta-embedded#18 (embed() returns NULL) before the recall pipeline can actually fire end-to-end.
 
-**B2. Semantic fact recall via embeddings.** ✅ **Already active** — verified 2026-04-23. `recallFacts` takes `context` (set to the last user-message text in `prompt.ts:1512`) and runs the embedding-ranked query first (`knowledge/index.ts:125-139`). Spot-checked the dj-11740 probe state: 14 knowledge rows all stored with non-null embeddings, no embed-related errors in the log, and recalled facts were semantically relevant (Django-migration topics for a Django-migration task). Keep this lever here in case we later want to tune the 0.7/0.3 cosine-vs-importance blend.
+**B2. Semantic fact recall via embeddings.** Code path exists, runtime is dead. `recallFacts` and `recallPlays` both try vector similarity first; both fall through silently because Zeta's `embed()` SQL function returns NULL (zeta-embedded#18). The keyword/importance fallback in `recallFacts` is what's been running in practice. The earlier "verified 2026-04-23" note was wrong — that spot-check misread a probe environment where embeddings happened to be populated from a prior session, not evidence of recall correctness. Blocked on zeta-embedded#18 to rebuild the NAPI binding with `local-embed` wired correctly.
 
-**B3. "Files to start with" injection.** ✅ **Shipped as part of #15 (plays).** Plays record problem+files-touched and recall by embedding similarity. Measured on dj-11740 (honest re-run, post-zengram-bench#2 fix): rep 2 with 2 prior plays → **19 turns / 63K prompt tokens** (vs rep 1's 30-cap / 175K). Turn reduction: 37%. Followup: tune the recall threshold and reduce the cold-start cost on rep 0 where the block gets re-sent but doesn't yet help.
+**B3. "Files to start with" injection.** Code shipped (#15 + #18). Runtime blocked on zeta-embedded#18 — plays persist but the embedding column stays NULL so the semantic recall that surfaces them never fires. Once embed() works, re-run the 3-rep multi-session bench and look for a genuine turn-count drop on rep 2 outside dj-11740's 12–31 variance band.
 
 **B4. Extracted "plays."** On successful completion, Zengram extracts the tool-call path that worked (`read → grep → edit → test`) and stores it as a reusable sketch keyed by task signature. On similar future tasks, inject "here's what worked last time." **Expected:** large if it works — but needs prompt engineering and quality-filtering. **Effort:** large.
 
