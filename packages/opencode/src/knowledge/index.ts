@@ -660,3 +660,198 @@ export function formatWorkspaceBlock(files: WorkspaceFileEntry[]): string | null
   if (lines.length === 0) return null
   return `<zengram-workspace>\n${lines.join("\n")}\n</zengram-workspace>`
 }
+
+// ── Plays (successful session shortcuts) ─────────────────────────────────────
+//
+// A "play" is the compact record of a session that actually did work: the
+// problem statement it tackled + the files it touched (modified / read). When
+// a new session starts on a semantically similar problem, Zengram recalls the
+// top-N most similar plays and injects their file lists as a
+// <zengram-previously-helpful> block so the agent can skip the exploration
+// phase. Stored in the `knowledge` table with scope="/play" so we inherit
+// embedding indexing + decay + lifecycle management for free.
+//
+// Rationale: exactly-matching tasks are rare; similar tasks are common. The
+// value is "last time a Django migration FK-dependency bug showed up, these
+// files were the fix" — concrete, task-anchored, directly actionable.
+
+export type PlayEntry = {
+  id: string
+  subject: string       // first ~120 chars of the problem statement
+  content: string       // rendered file list
+  source_session: string | null
+  importance: number
+}
+
+const PLAY_SCOPE = "/play"
+const PLAY_SUBJECT_MAX = 120
+
+function playSubjectForSession(sessionId: string, problem: string): string {
+  // Use a session-scoped prefix so the same session can UPSERT its own row.
+  // The problem-statement excerpt is the semantic payload for embedding.
+  const excerpt = problem.replace(/\s+/g, " ").trim().slice(0, PLAY_SUBJECT_MAX)
+  return `[${sessionId}] ${excerpt}`
+}
+
+function renderPlayContent(files: WorkspaceFileEntry[]): string {
+  const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
+  const deepRead = files.filter((f) => f.edit_state !== "modified" && f.understanding === "deep")
+
+  const lines: string[] = []
+  if (modified.length > 0) {
+    lines.push("Files modified to solve the problem:")
+    for (const f of modified) {
+      const tag = f.edit_state === "deleted" ? " (deleted)" : ""
+      lines.push(`  - ${f.file_path}${tag}`)
+    }
+  }
+  if (deepRead.length > 0) {
+    lines.push("Files read closely (not modified):")
+    for (const f of deepRead.slice(0, 10)) lines.push(`  - ${f.file_path}`)
+  }
+  return lines.join("\n")
+}
+
+/**
+ * Record a play for a completed session. Fire-and-forget: exceptions are
+ * logged but never propagated. Idempotent — called on every assistant-turn
+ * finish, UPSERTs the same row so the latest state wins.
+ *
+ * No-ops silently if the session has no problem statement or no modified /
+ * deep-read files (nothing useful to record).
+ */
+export async function recordPlay(input: {
+  projectId: ProjectID
+  sessionId: SessionID
+}): Promise<void> {
+  const db = zengramDb()
+  const now = Date.now() * 1000
+
+  // Problem statement: the first user-message text part for this session.
+  const firstUserParts = await db.query<{ data: any }>(
+    `SELECT p.data FROM part p
+     JOIN turn t ON t.id = p.turn_id
+     WHERE t.session_id = $1 AND t.role = 'user' AND p.type = 'text'
+     ORDER BY t.time_created ASC, p.position ASC
+     LIMIT 1`,
+    [input.sessionId],
+  )
+  if (firstUserParts.length === 0) return
+  const raw = firstUserParts[0].data
+  const data = typeof raw === "string" ? JSON.parse(raw) : raw
+  const problem = (data as { text?: string } | null)?.text ?? ""
+  if (problem.length < 20) return
+
+  const files = await db.query<WorkspaceFileEntry>(
+    `SELECT file_path, understanding, edit_state, relevance
+     FROM workspace_file
+     WHERE session_id = $1
+     ORDER BY
+       CASE edit_state WHEN 'modified' THEN 0 WHEN 'deleted' THEN 1 ELSE 2 END,
+       CASE understanding WHEN 'deep' THEN 0 WHEN 'read' THEN 1 ELSE 2 END`,
+    [input.sessionId],
+  )
+  const content = renderPlayContent(files)
+  if (content.length === 0) return // no modified / deep-read files → nothing useful
+
+  const subject = playSubjectForSession(input.sessionId, problem)
+
+  // UPSERT on (project_id, scope, subject) — existing learnFact only updates
+  // access counts, we need content + embedding refresh too.
+  const existing = await db.query<{ id: string }>(
+    `SELECT id FROM knowledge
+     WHERE project_id = $1 AND scope = $2 AND subject = $3 AND status = 'active'
+     LIMIT 1`,
+    [input.projectId, PLAY_SCOPE, subject],
+  )
+
+  if (existing[0]) {
+    await db.execute(
+      `UPDATE knowledge SET content = $1, time_updated = $2 WHERE id = $3`,
+      [content, now, existing[0].id],
+    )
+    // Refresh embedding — subject didn't change, but do it so vector matches
+    // latest content. Fire-and-forget; vector recall still works if it fails.
+    db.execute(
+      `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
+      [existing[0].id],
+    ).catch((e) => log.warn("play embedding refresh failed", { err: e }))
+    return
+  }
+
+  const id = "knw_" + ulid().toLowerCase()
+  await db.execute(
+    `INSERT INTO knowledge
+       (id, project_id, scope, subject, content, source_type, source_session,
+        status, importance, confidence, access_count, time_created, time_updated)
+     VALUES ($1,$2,$3,$4,$5,'agent',$6,'active',0.8,0.9,0,$7,$8)`,
+    [id, input.projectId, PLAY_SCOPE, subject, content, input.sessionId, now, now],
+  )
+  db.execute(
+    `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
+    [id],
+  ).catch((e) => log.warn("play embed on insert failed", { err: e }))
+}
+
+/**
+ * Recall the top-N plays most semantically similar to the current problem
+ * statement. Falls through to empty on any error — plays are a bonus signal,
+ * not critical-path.
+ *
+ * Filters out self (excludeSessionId) so a session can't recall its own play.
+ * This matters during a single session: recordPlay fires on every turn and
+ * would otherwise surface the current session's own file list as a "hint".
+ */
+export async function recallPlays(input: {
+  projectId: ProjectID
+  problem: string
+  excludeSessionId?: SessionID
+  limit?: number
+  minImportance?: number
+}): Promise<PlayEntry[]> {
+  if (!input.problem || input.problem.length < 20) return []
+  const db = zengramDb()
+  const limit = Math.min(input.limit ?? 3, 10)
+
+  try {
+    const rows = await db.query<PlayEntry>(
+      `SELECT id, subject, content, source_session, importance
+       FROM knowledge
+       WHERE project_id = $1
+         AND scope = $2
+         AND status = 'active'
+         AND embedding IS NOT NULL
+         AND ($3::text IS NULL OR source_session IS NULL OR source_session != $3)
+       ORDER BY (embedding <-> embed($4)) ASC
+       LIMIT ${limit}`,
+      [input.projectId, PLAY_SCOPE, input.excludeSessionId ?? null, input.problem],
+    )
+    return rows
+  } catch (e) {
+    log.warn("recallPlays failed", { err: e })
+    return []
+  }
+}
+
+/**
+ * Render recalled plays as a <zengram-previously-helpful> block. Null when
+ * no plays → no block in the system prompt.
+ */
+export function formatPlaysBlock(plays: PlayEntry[]): string | null {
+  if (plays.length === 0) return null
+
+  const lines: string[] = [
+    "Similar past sessions on this project were solved with the file changes below.",
+    "Read these files first before broad exploration — the problem domain overlaps.",
+    "",
+  ]
+  for (const play of plays) {
+    // Strip the "[session_id] " prefix from the stored subject for display.
+    const cleanSubject = play.subject.replace(/^\[[^\]]+\]\s*/, "")
+    lines.push(`From a similar problem: "${cleanSubject.slice(0, 100)}${cleanSubject.length > 100 ? "…" : ""}"`)
+    // Content is already the formatted file list.
+    for (const line of play.content.split("\n")) lines.push(`  ${line}`)
+    lines.push("")
+  }
+  return `<zengram-previously-helpful>\n${lines.join("\n").trimEnd()}\n</zengram-previously-helpful>`
+}

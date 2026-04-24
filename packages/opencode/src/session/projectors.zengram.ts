@@ -17,7 +17,7 @@ import { MessageV2 } from "./message-v2"
 import { zengramDb } from "@/storage/db.zengram"
 import { Log } from "../util/log"
 import { randomUUID } from "node:crypto"
-import { extractAndLearn, decayKnowledge } from "@/knowledge"
+import { extractAndLearn, decayKnowledge, recordPlay } from "@/knowledge"
 import { coding } from "@zengram/sdk"
 import type { FileOperation } from "@zengram/sdk"
 import { Instance } from "@/project/instance"
@@ -199,6 +199,14 @@ export default [
 
       decayKnowledge({ projectId: Instance.project.id })
         .catch((err) => log.warn("knowledge decay failed", { err }))
+
+      // Record/refresh the session's play (problem → files touched) so
+      // future sessions with similar problem statements can shortcut
+      // exploration. Idempotent UPSERT; safe to call on every turn.
+      recordPlay({
+        projectId: Instance.project.id,
+        sessionId: info.sessionID,
+      }).catch((err) => log.warn("recordPlay failed", { err }))
     }
   }),
 
