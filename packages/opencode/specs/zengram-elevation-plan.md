@@ -7,24 +7,26 @@ elevation or rule something out.
 
 ---
 
-## Status snapshot (post-2026-04-23)
+## Status snapshot (post-2026-04-24)
 
-| axis | 2026-04-09 zengram (pre-fix) | today (post-#11/#12/#13) | baseline (SQLite) |
-|---|---|---|---|
-| dj-11740 prompt tokens | 80,388 | **26,436** | 31,229 |
-| dj-11740 turns | 31 | 30 | 30 |
-| dj-11740 duration | 206 s | **100 s** | ≈170 s |
-| completion rate | 100% | 100% | 100% |
+| axis | 2026-04-09 zengram (pre-fix) | after #11/#12/#13 | **after #15 (plays)** | baseline (SQLite) |
+|---|---|---|---|---|
+| dj-11740 prompt tokens | 80,388 | 26,436 | **14,308** (rep 2) | 31,229 |
+| dj-11740 turns | 31 | 30 | **16** (rep 2) | 30 |
+| dj-11740 duration | 206 s | 100 s | **123 s** (rep 2) | ≈170 s |
+| completion rate | 100% | 100% | 100% | 100% |
 
-**Result so far:** we closed the cost overhead. Zengram is now **cheaper than
-the SQLite baseline** on dj-11740. Turn count is flat, so the promised
-turn-reduction from persistent memory hasn't materialized yet — that is the
-next frontier.
+**Result so far:** we closed the cost overhead with #11-#13 (Zengram cheaper
+than the SQLite baseline on fresh sessions). Then #15 (play recall) delivered
+the compounding-value promise: by rep 2 of a 3-rep multi-session run,
+Zengram's accumulated state lets the model solve the identical task in **16
+turns instead of 30** — a 47% turn reduction vs the 2026-04-23 B1 baseline.
 
 ### Fixes that got us here
 - [#11](https://github.com/genezhang/opencode/pull/11) — JSONB string decode on `part.data`. Sessions couldn't complete a single real turn before this.
 - [#12](https://github.com/genezhang/opencode/pull/12) — `ToolPart` projector field names + `extractAndLearn` JSONB decode. Every tool_call row had `tool_id="unknown"`/`state="pending"`; `workspace_file` never populated; recallFacts ran on JSON scaffolding.
 - [#13](https://github.com/genezhang/opencode/pull/13) — Collapse stable system prefix into one cache-friendly message. Ws-change turns went from 5% cache hit to 89-100%.
+- [#15](https://github.com/genezhang/opencode/pull/15) — Play recall: record problem+files-touched per session, recall by embedding similarity, inject as `<zengram-previously-helpful>` with explicit "read these first" framing. First measurable turn reduction from accumulated Zengram state.
 - [#8](https://github.com/genezhang/opencode/pull/8) — Instrumentation (`OPENCODE_LOG_CONTEXT_SIZES`). How we found all of the above.
 
 ---
@@ -45,17 +47,17 @@ next frontier.
 
 ### B. Turns-side (the harder, higher-value direction)
 
-**B1. Multi-session bench methodology.** ✅ **Harness landed (zengram-bench#1)**, first experiment **didn't validate the thesis** (2026-04-23). 3-rep run on dj-11740 with persistent Zengram state produced: rep 0: 26 turns / 29.9K prompt; rep 1: 30 turns / 26.2K; rep 2: 30 turns / 34.4K. Reps 1 & 2 hit the 30-turn cap instead of shortening. Per-turn prompt tokens dropped slightly (rep 1 better cache), but the turn-count win from "shortcut via recalled state" didn't materialize. Three candidate explanations, in priority order: (a) extracted facts are noisy / not actionable → see **B5**; (b) single-task at n=1 is too small to beat model variance → add more reps + more tasks once rate limits allow; (c) 30-turn cap masks whatever signal does exist. Don't rerun B1 on its own — pair it with B3 / B5 / B6.
+**B1. Multi-session bench methodology.** ✅ **Validated with plays (2026-04-24).** Harness landed in zengram-bench#1. First experiment without plays (2026-04-23) didn't show the thesis: reps 1 & 2 hit the 30-turn cap. Re-run after #15 (play recall) showed clear compounding: 26 → 26 → **16 turns** across 3 reps, vs 26 → 30 → 30 without plays. Conclusion: persistent state is necessary but not sufficient — what's recalled has to be *file-anchored and task-matched* to shortcut exploration. Facts alone don't; plays do.
 
 **B2. Semantic fact recall via embeddings.** ✅ **Already active** — verified 2026-04-23. `recallFacts` takes `context` (set to the last user-message text in `prompt.ts:1512`) and runs the embedding-ranked query first (`knowledge/index.ts:125-139`). Spot-checked the dj-11740 probe state: 14 knowledge rows all stored with non-null embeddings, no embed-related errors in the log, and recalled facts were semantically relevant (Django-migration topics for a Django-migration task). Keep this lever here in case we later want to tune the 0.7/0.3 cosine-vs-importance blend.
 
-**B3. "Files to start with" injection.** Use cross-session `workspace_file` history, keyed by project + problem-statement similarity, to pre-suggest files the agent should read first. Current workspace-block only shows files touched *this* session, so it's useless on the first few turns. **Expected:** 3-5 fewer exploration turns per task if it works. **Effort:** medium (ranking logic + fresh-session injection).
+**B3. "Files to start with" injection.** ✅ **Shipped as part of #15 (plays).** Plays record problem+files-touched and recall by embedding similarity. Measured on dj-11740: rep 2 with 2 prior plays → **16 turns** (vs 30 without). Turn reduction: 47%. Followup: tune the recall threshold once we have more tasks (currently top-3, no min-similarity filter).
 
 **B4. Extracted "plays."** On successful completion, Zengram extracts the tool-call path that worked (`read → grep → edit → test`) and stores it as a reusable sketch keyed by task signature. On similar future tasks, inject "here's what worked last time." **Expected:** large if it works — but needs prompt engineering and quality-filtering. **Effort:** large.
 
 **B5. LLM-judged fact-quality audit.** Sample 50+ extracted facts from real sessions, rate them useful/noisy, prune the `extractFacts` heuristics that produce noise. Then re-run the audit. **Expected:** better signal-to-noise in the recall block; may also shrink the average block size. **Effort:** medium (offline, but LLM-gated).
 
-**B6. Prompt-level guidance.** Add a short system-prompt line telling the model how to use the Zengram recall block (e.g. "Treat the `<zengram-knowledge>` block as hints from prior successful sessions — prefer following its suggested files/approach over re-discovering"). **Expected:** modest; the model may already do this, but explicit guidance removes ambiguity. **Effort:** trivial.
+**B6. Prompt-level guidance.** ✅ **Shipped with #15** — the `<zengram-previously-helpful>` header reads *"Read these files first before broad exploration — the problem domain overlaps."* This framing is baked into `formatPlaysBlock`, so every recall includes the directive. Consider extending similar framing to `<zengram-knowledge>` if the fact-quality audit (B5) shows recalled facts are useful.
 
 ---
 
@@ -71,7 +73,7 @@ next frontier.
 
 ## Ruled out / deferred
 
-- **"Just add persistent state and turns will drop"** (implicit assumption behind B1). First multi-session experiment (2026-04-23, dj-11740, 3 reps) invalidated it: accumulated Zengram state did not reduce turn count. Persistent state is *necessary* (you can't recall from nothing) but not *sufficient* — what's recalled has to be actionable. Focus moves to injection quality (B3/B5/B6).
+- **"Just add persistent state and turns will drop"** (implicit assumption behind B1). First multi-session experiment (2026-04-23, dj-11740, 3 reps, facts-only) invalidated it: accumulated Zengram state did not reduce turn count. Persistent state is *necessary* but not *sufficient* — what's recalled has to be actionable. Re-tested 2026-04-24 with plays (#15): turn count dropped 30 → 16 by rep 2. Conclusion refined: **persistent state + file-anchored recall = compounding win**; generic facts alone don't move the needle.
 
 ---
 
