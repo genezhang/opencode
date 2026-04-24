@@ -731,13 +731,25 @@ export async function recordPlay(input: {
     const now = Date.now() * 1000
 
     // Problem statement: the first user-message text part for this session.
-    const firstUserParts = await db.query<{ data: any }>(
-      `SELECT p.data FROM part p
-       JOIN turn t ON t.id = p.turn_id
-       WHERE t.session_id = $1 AND t.role = 'user' AND p.type = 'text'
-       ORDER BY t.time_created ASC, p.position ASC
+    // We split this into two queries deliberately — an equivalent JOIN query
+    // (`SELECT p.data FROM part p JOIN turn t ON t.id = p.turn_id WHERE
+    // t.session_id = $1 AND t.role = 'user' AND p.type = 'text'`) silently
+    // returns rows with `p.*` columns undefined on embedded Zeta. Two queries
+    // sidestep that bug and cost one extra round-trip in a fire-and-forget path.
+    const firstUserTurn = await db.query<{ id: string }>(
+      `SELECT id FROM turn
+       WHERE session_id = $1 AND role = 'user'
+       ORDER BY time_created ASC
        LIMIT 1`,
       [input.sessionId],
+    )
+    if (firstUserTurn.length === 0) return
+    const firstUserParts = await db.query<{ data: any }>(
+      `SELECT data FROM part
+       WHERE turn_id = $1 AND type = 'text'
+       ORDER BY position ASC
+       LIMIT 1`,
+      [firstUserTurn[0].id],
     )
     if (firstUserParts.length === 0) return
     const raw = firstUserParts[0].data
@@ -759,41 +771,30 @@ export async function recordPlay(input: {
 
     const subject = playSubjectForSession(input.sessionId, problem)
 
-    // UPSERT on (project_id, scope, subject) — existing learnFact only updates
-    // access counts, we need content + embedding refresh too.
-    const existing = await db.query<{ id: string }>(
-      `SELECT id FROM knowledge
-       WHERE project_id = $1 AND scope = $2 AND subject = $3 AND status = 'active'
-       LIMIT 1`,
-      [input.projectId, PLAY_SCOPE, subject],
-    )
-
-    if (existing[0]) {
-      await db.execute(
-        `UPDATE knowledge SET content = $1, time_updated = $2 WHERE id = $3`,
-        [content, now, existing[0].id],
-      )
-      // Refresh embedding — subject didn't change, but do it so vector matches
-      // latest content. Inner fire-and-forget; vector recall still works if it fails.
-      db.execute(
-        `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
-        [existing[0].id],
-      ).catch((e) => log.warn("play embedding refresh failed", { err: e }))
-      return
-    }
-
-    const id = "knw_" + ulid().toLowerCase()
+    // Deterministic id keyed off the session so repeated recordPlay calls
+    // within a session hit the same row via ON CONFLICT DO UPDATE — no
+    // SELECT-then-INSERT race on MVCC visibility (Zeta can fail to surface
+    // our own prior INSERT to the same-session SELECT, producing duplicate
+    // rows instead of updating).
+    const id = `knw_play_${input.sessionId}`
     await db.execute(
       `INSERT INTO knowledge
          (id, project_id, scope, subject, content, source_type, source_session,
           status, importance, confidence, access_count, time_created, time_updated)
-       VALUES ($1,$2,$3,$4,$5,'agent',$6,'active',0.8,0.9,0,$7,$8)`,
+       VALUES ($1,$2,$3,$4,$5,'agent',$6,'active',0.8,0.9,0,$7,$8)
+       ON CONFLICT (id) DO UPDATE SET
+         subject = EXCLUDED.subject,
+         content = EXCLUDED.content,
+         time_updated = EXCLUDED.time_updated`,
       [id, input.projectId, PLAY_SCOPE, subject, content, input.sessionId, now, now],
     )
+    // Refresh embedding so vector recall matches the latest content. Inner
+    // fire-and-forget; vector recall still works if it fails (the row is
+    // written either way).
     db.execute(
       `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
       [id],
-    ).catch((e) => log.warn("play embed on insert failed", { err: e }))
+    ).catch((e) => log.warn("play embedding refresh failed", { err: e }))
   } catch (err) {
     log.warn("recordPlay failed", { sessionId: input.sessionId, err })
   }
