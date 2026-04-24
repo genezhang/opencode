@@ -42,7 +42,14 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
-import { recallFacts, formatKnowledgeBlock, recallWorkspaceContext, formatWorkspaceBlock } from "@/knowledge"
+import {
+  recallFacts,
+  formatKnowledgeBlock,
+  recallWorkspaceContext,
+  formatWorkspaceBlock,
+  recallPlays,
+  formatPlaysBlock,
+} from "@/knowledge"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
 import { Truncate } from "@/tool/truncate"
@@ -1499,22 +1506,34 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
                 yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-                const [skills, env, instructions, modelMsgs, knowledgeFacts, workspaceFiles] = yield* Effect.all([
+                const userText = lastUserMsg?.parts
+                  .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
+                  .map((p) => p.text)
+                  .join(" ") || ""
+                const [skills, env, instructions, modelMsgs, knowledgeFacts, workspaceFiles, plays] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.skills(agent)),
                   Effect.promise(() => SystemPrompt.environment(model)),
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
-                  Effect.promise(() => {
-                    const userText = lastUserMsg?.parts
-                      .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
-                      .map((p) => p.text)
-                      .join(" ")
-                    return recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined })
-                  }),
+                  Effect.promise(() =>
+                    recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined }),
+                  ),
                   Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID })),
+                  // Plays: files that solved semantically-similar past problems.
+                  // Exclude this session so recordPlay's fire-and-forget writes
+                  // don't surface our own in-progress file list as a "hint".
+                  Effect.promise(() =>
+                    recallPlays({
+                      projectId: Instance.project.id,
+                      problem: userText,
+                      excludeSessionId: sessionID,
+                      limit: 3,
+                    }),
+                  ),
                 ])
                 const knowledgeBlock = formatKnowledgeBlock(knowledgeFacts)
                 const workspaceBlock = formatWorkspaceBlock(workspaceFiles)
+                const playsBlock = formatPlaysBlock(plays)
                 // Collapse stable content (env + skills + instructions + any
                 // structured-output directive) into ONE system message so the
                 // first applyCaching breakpoint (`slice(0, 2)` in
@@ -1533,7 +1552,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ]
                 if (format.type === "json_schema") stableParts.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
                 const system: string[] = [stableParts.join("\n\n")]
-                const zengramBlock = [knowledgeBlock, workspaceBlock].filter(Boolean).join("\n\n")
+                // Order: plays → workspace → knowledge. Plays are the highest-signal
+                // "here's where to look first" hint; putting them at the top of the
+                // dynamic trailer means the model reads them before being overwhelmed
+                // by the longer facts/workspace blocks.
+                const zengramBlock = [playsBlock, workspaceBlock, knowledgeBlock].filter(Boolean).join("\n\n")
                 if (zengramBlock) system.push(zengramBlock)
                 // dj-11740 instrumentation — tracks per-turn context-block sizes
                 // so the bench re-run can attribute the 2.02× prompt-token ratio.
@@ -1544,16 +1567,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 if (Flag.OPENCODE_LOG_CONTEXT_SIZES) {
                   const wsChars = workspaceBlock?.length ?? 0
                   const kbChars = knowledgeBlock?.length ?? 0
+                  const plChars = playsBlock?.length ?? 0
                   const sysChars = system.reduce((n, s) => n + s.length, 0)
                   log.info("context.sizes", {
                     sessionID,
                     messageID: handle.message.id,
                     workspaceFiles: workspaceFiles.length,
                     knowledgeFacts: knowledgeFacts.length,
+                    plays: plays.length,
                     workspaceChars: wsChars,
                     workspaceTokensEst: Math.ceil(wsChars / 4),
                     knowledgeChars: kbChars,
                     knowledgeTokensEst: Math.ceil(kbChars / 4),
+                    playsChars: plChars,
+                    playsTokensEst: Math.ceil(plChars / 4),
                     systemChars: sysChars,
                     systemTokensEst: Math.ceil(sysChars / 4),
                   })
