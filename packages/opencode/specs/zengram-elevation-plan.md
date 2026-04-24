@@ -7,7 +7,7 @@ elevation or rule something out.
 
 ---
 
-## Status snapshot (post-2026-04-23)
+## Status snapshot (post-2026-04-24)
 
 | axis | 2026-04-09 zengram (pre-fix) | after #11/#12/#13 | **after #15 (plays)** | baseline (SQLite) |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@ elevation or rule something out.
 than the SQLite baseline on fresh sessions). Then #15 (play recall) delivered
 the compounding-value promise: by rep 2 of a 3-rep multi-session run,
 Zengram's accumulated state lets the model solve the identical task in **16
-turns instead of 30** — a 47% turn reduction vs yesterday's B1 baseline.
+turns instead of 30** — a 47% turn reduction vs the 2026-04-23 B1 baseline.
 
 ### Fixes that got us here
 - [#11](https://github.com/genezhang/opencode/pull/11) — JSONB string decode on `part.data`. Sessions couldn't complete a single real turn before this.
