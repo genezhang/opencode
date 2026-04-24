@@ -45,7 +45,7 @@ next frontier.
 
 ### B. Turns-side (the harder, higher-value direction)
 
-**B1. Multi-session bench methodology.** ← RECOMMENDED NEXT. The current bench runs each task *once*, fresh. Zengram's value is compounding across sessions. Extend `zengram-bench` to run the same task 3× in sequence with persistent Zengram state, measure turn count of runs 2 and 3. If runs 2/3 complete in fewer turns than run 1, Zengram's thesis is validated. **Expected:** shows (or disproves) whether all our downstream work will pay off. **Effort:** small (harness change + a cross-session storage hook).
+**B1. Multi-session bench methodology.** ✅ **Harness landed (zengram-bench#1)**, first experiment **didn't validate the thesis** (2026-04-23). 3-rep run on dj-11740 with persistent Zengram state produced: rep 0: 26 turns / 29.9K prompt; rep 1: 30 turns / 26.2K; rep 2: 30 turns / 34.4K. Reps 1 & 2 hit the 30-turn cap instead of shortening. Per-turn prompt tokens dropped slightly (rep 1 better cache), but the turn-count win from "shortcut via recalled state" didn't materialize. Three candidate explanations, in priority order: (a) extracted facts are noisy / not actionable → see **B5**; (b) single-task at n=1 is too small to beat model variance → add more reps + more tasks once rate limits allow; (c) 30-turn cap masks whatever signal does exist. Don't rerun B1 on its own — pair it with B3 / B5 / B6.
 
 **B2. Semantic fact recall via embeddings.** ✅ **Already active** — verified 2026-04-23. `recallFacts` takes `context` (set to the last user-message text in `prompt.ts:1512`) and runs the embedding-ranked query first (`knowledge/index.ts:125-139`). Spot-checked the dj-11740 probe state: 14 knowledge rows all stored with non-null embeddings, no embed-related errors in the log, and recalled facts were semantically relevant (Django-migration topics for a Django-migration task). Keep this lever here in case we later want to tune the 0.7/0.3 cosine-vs-importance blend.
 
@@ -71,7 +71,7 @@ next frontier.
 
 ## Ruled out / deferred
 
-*(none yet — populate as we rule things out)*
+- **"Just add persistent state and turns will drop"** (implicit assumption behind B1). First multi-session experiment (2026-04-23, dj-11740, 3 reps) invalidated it: accumulated Zengram state did not reduce turn count. Persistent state is *necessary* (you can't recall from nothing) but not *sufficient* — what's recalled has to be actionable. Focus moves to injection quality (B3/B5/B6).
 
 ---
 
