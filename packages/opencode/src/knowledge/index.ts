@@ -6,6 +6,7 @@
  */
 
 import { generateText } from "ai"
+import path from "node:path"
 import { zengramDb, type Queryable } from "@/storage/db.zengram"
 import { ulid } from "ulid"
 import { Log } from "@/util/log"
@@ -702,15 +703,14 @@ interface EditChange {
 
 function renderPlayContent(
   files: WorkspaceFileEntry[],
-  sketch: string[],
   edits: EditChange[],
   rootDir?: string,
 ): string {
   // Compact format: a play is most useful as a "go look at THIS file" pointer
-  // plus a hint at the diff shape. Tool-sequence narrative ("grep → read →
-  // edit") and deep-read file lists added bytes without changing model
-  // behavior in the bench (still 5–6 turns regardless), and every byte hurts
-  // the prefix KV cache. Keep file list + diff preview only.
+  // plus a hint at the diff shape. Tool-sequence narrative and deep-read file
+  // lists added bytes without changing model behavior in the bench (still
+  // 5–6 turns regardless), and every byte hurts the prefix KV cache. Keep
+  // file list + diff preview only.
   const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
   // Fall back to deriving the modified-file list from edits when workspace_file
   // hasn't projected yet — same race as the tool_call lag we work around in
@@ -726,8 +726,6 @@ function renderPlayContent(
       lines.push(`  ${truncateForPlay(e.newString)}`)
     }
   }
-  // sketch and deep-read intentionally dropped — see comment above.
-  void sketch
   return lines.join("\n")
 }
 
@@ -740,85 +738,23 @@ function truncateForPlay(s: string): string {
     : collapsed
 }
 
+/**
+ * Make a path repo-relative for display in plays. Mirrors the pattern used in
+ * tool/apply_patch.ts (path.relative + replaceAll) so plays are stable across
+ * platforms and don't show absolute paths or backslash separators on Windows.
+ */
 function toRepoRelative(file: string, rootDir?: string): string {
   if (!rootDir) return file
-  const prefix = rootDir.endsWith("/") ? rootDir : rootDir + "/"
-  return file.startsWith(prefix) ? file.slice(prefix.length) : file
-}
-
-/**
- * Build a compact tool-call sketch for a session — an ordered, deduplicated
- * list like `grep(migrations) → read(autodetector.py) → edit(autodetector.py)`.
- * Caps at 12 steps so we don't bloat the prompt on long sessions.
- */
-const SKETCH_MAX_STEPS = 12
-const SKETCH_FILE_ARG_KEYS = ["filePath", "path", "file", "pattern"] as const
-// Shell commands that tell the model nothing about the problem structure
-// (directory hopping, env probing, file existence checks). Drop them so
-// the sketch stays focused on productive steps.
-const BASH_NOISE_HEADS = new Set([
-  "cd", "ls", "pwd", "which", "echo", "env", "printenv", "clear", "true", "false",
-])
-
-async function buildToolSketch(
-  db: Queryable,
-  sessionId: SessionID,
-  rootDir?: string,
-): Promise<string[]> {
-  const rows = await db.query<{ tool_id: string; input: any }>(
-    `SELECT tool_id, input FROM tool_call
-     WHERE session_id = $1 AND state = 'completed'
-     ORDER BY time_created ASC`,
-    [sessionId],
-  )
-  const steps: string[] = []
-  let prev = ""
-  for (const r of rows) {
-    const tool = r.tool_id || "tool"
-    const raw = r.input
-    const parsed = typeof raw === "string" ? safeParse(raw) : raw
-    if (isNoiseStep(tool, parsed)) continue
-    const argStr = describeToolInput(tool, parsed, rootDir)
-    const step = argStr ? `${tool}(${argStr})` : tool
-    if (step === prev) continue // collapse immediate repeats
-    steps.push(step)
-    prev = step
-    if (steps.length >= SKETCH_MAX_STEPS) break
-  }
-  return steps
-}
-
-function isNoiseStep(tool: string, input: unknown): boolean {
-  if (tool !== "bash") return false
-  if (!input || typeof input !== "object") return false
-  const cmd = (input as Record<string, unknown>)["command"]
-  if (typeof cmd !== "string") return false
-  const head = cmd.trim().split(/\s+/)[0] ?? ""
-  return BASH_NOISE_HEADS.has(head.toLowerCase())
+  const rel = path.relative(rootDir, file).replaceAll("\\", "/")
+  // path.relative returns "..", "../foo" etc when `file` lives outside rootDir;
+  // keep the original absolute path in that case so plays don't render
+  // misleading "../../tmp/..." breadcrumbs.
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return file.replaceAll("\\", "/")
+  return rel
 }
 
 function safeParse(s: string): unknown {
   try { return JSON.parse(s) } catch { return null }
-}
-
-function describeToolInput(tool: string, input: unknown, rootDir?: string): string {
-  if (!input || typeof input !== "object") return ""
-  const rec = input as Record<string, unknown>
-  for (const key of SKETCH_FILE_ARG_KEYS) {
-    const v = rec[key]
-    if (typeof v === "string" && v.length > 0) {
-      const short = toRepoRelative(v, rootDir)
-      // For bash, show the first word of the command rather than the whole thing.
-      if (tool === "bash" && key === "pattern") return short
-      return short.length > 60 ? short.slice(0, 57) + "..." : short
-    }
-  }
-  // bash's command lives under `command`; show its head.
-  if (tool === "bash" && typeof rec["command"] === "string") {
-    const head = (rec["command"] as string).trim().split(/\s+/)[0] ?? ""
-    return head.slice(0, 20)
-  }
-  return ""
 }
 
 /**
@@ -841,11 +777,17 @@ async function buildEditChanges(
   // short sessions (3–6 tool calls, edit near the end) finish before the
   // edit row commits — leaving plays with file paths only.
   //
+  // The JOIN explicitly aliases `p.data AS data` because Zeta's result-set
+  // column naming surfaces JOIN-side columns as "p.data" rather than "data"
+  // unless aliased; without the alias `r.data` is undefined and no edits get
+  // captured. Same trick applies anywhere in this file we read columns from
+  // a JOIN-qualified select.
+  //
   // Each tool-call part stores the call as JSON in `data`:
   //   { state: { input: {filePath, oldString, newString | content}, ... }, ... }
   // The `tool` field on the JSON tells us which tool was invoked.
   const rows = await db.query<{ data: any }>(
-    `SELECT p.data FROM part p
+    `SELECT p.data AS data FROM part p
      JOIN turn t ON p.turn_id = t.id
      WHERE t.session_id = $1 AND p.type = 'tool'
      ORDER BY t.time_created ASC, p.position ASC`,
@@ -897,11 +839,12 @@ export async function recordPlay(input: {
     // with the session.title as a fallback when the user-turn row isn't
     // visible yet (projectAsync ordering isn't guaranteed — we've seen
     // recordPlay fire on an assistant-finish before the user turn's
-    // MessageV2.Event.Updated projector committed).
-    //
-    // We split the user-turn/part lookup into two queries deliberately — an
-    // equivalent JOIN silently returns rows with `p.*` columns undefined on
-    // embedded Zeta; two queries sidestep that bug in a fire-and-forget path.
+    // MessageV2.Event.Updated projector committed). resolveProblem performs
+    // the lookup as two queries (turn → part) rather than a single JOIN
+    // because Zeta surfaces JOIN columns keyed as "p.<col>" rather than
+    // "<col>" unless aliased — splitting sidesteps the alias requirement on
+    // a fire-and-forget path; see buildEditChanges for the alias-based
+    // alternative used where a JOIN is the natural shape.
     const problem = await resolveProblem(db, input.sessionId)
     if (!problem || problem.length < 20) {
       log.info("recordPlay skipped: short problem", { sessionId: input.sessionId, len: problem?.length ?? 0 })
@@ -917,11 +860,8 @@ export async function recordPlay(input: {
          CASE understanding WHEN 'deep' THEN 0 WHEN 'read' THEN 1 ELSE 2 END`,
       [input.sessionId],
     )
-    const [sketch, edits] = await Promise.all([
-      buildToolSketch(db, input.sessionId, input.rootDir),
-      buildEditChanges(db, input.sessionId),
-    ])
-    const content = renderPlayContent(files, sketch, edits, input.rootDir)
+    const edits = await buildEditChanges(db, input.sessionId)
+    const content = renderPlayContent(files, edits, input.rootDir)
     if (content.length === 0) {
       log.info("recordPlay skipped: no useful files", { sessionId: input.sessionId, fileRows: files.length })
       return
@@ -937,13 +877,16 @@ export async function recordPlay(input: {
     const id = `knw_play_${input.sessionId}`
 
     // Skip the write (and the expensive re-embed) when nothing changed.
-    // recordPlay fires on every assistant finish; most of those don't
-    // produce new files or edits.
-    const existing = await db.query<{ content: string }>(
-      `SELECT content FROM knowledge WHERE id = $1`,
+    // recordPlay fires on every assistant finish; most of those don't produce
+    // new files or edits. Compare subject AND content: an early call can hit
+    // the session.title fallback in resolveProblem (different subject) while
+    // the content stays the same; we still want to refresh the embedding
+    // when subject changes since embed() runs over `subject || '. ' || content`.
+    const existing = await db.query<{ subject: string; content: string }>(
+      `SELECT subject, content FROM knowledge WHERE id = $1`,
       [id],
     )
-    if (existing.length > 0 && existing[0].content === content) {
+    if (existing.length > 0 && existing[0].subject === subject && existing[0].content === content) {
       return
     }
     await db.execute(
@@ -1022,7 +965,22 @@ async function resolveProblem(db: Queryable, sessionId: SessionID): Promise<stri
 // turn N+1, every subsequent turn paid full prompt-processing cost. Plays
 // are global state from the perspective of one session — they don't change
 // mid-session — so we resolve once per session and reuse.
+//
+// FIFO-bounded so long-running modes (`opencode serve`) don't accumulate
+// entries indefinitely. Capacity 64 is an order of magnitude larger than
+// realistic concurrent-session counts; ended sessions either fall off
+// naturally as new ones land, or pay one extra DB round-trip after eviction
+// — both acceptable. JS Map preserves insertion order, so the first key is
+// the oldest entry.
+const PLAYS_CACHE_MAX = 64
 const playsBySession = new Map<SessionID, PlayEntry[]>()
+function rememberPlays(sessionId: SessionID, plays: PlayEntry[]): void {
+  if (playsBySession.size >= PLAYS_CACHE_MAX && !playsBySession.has(sessionId)) {
+    const oldest = playsBySession.keys().next().value
+    if (oldest !== undefined) playsBySession.delete(oldest)
+  }
+  playsBySession.set(sessionId, plays)
+}
 
 // Similarity gate: drop plays whose L2 distance to the current problem
 // embedding exceeds this. Empirical observation on this codebase with
@@ -1085,14 +1043,20 @@ export async function recallPlays(input: {
        LIMIT ${limit}`,
       [input.projectId, PLAY_SCOPE, now, input.excludeSessionId ?? null, queryText],
     )
-    const gated = rows.filter((r) => r.distance == null || r.distance <= maxDist)
+    // Fail closed on NULL distance: if embed($5) returned NULL (e.g. provider
+    // unregistered, model load failure, embedding pipeline broken), every row
+    // comes back with distance=NULL and the prior `distance == null ||` form
+    // would inject every play in the table regardless of similarity. Drop
+    // those rows so a broken embedding pipeline produces empty recall, not
+    // arbitrary plays.
+    const gated = rows.filter((r) => r.distance != null && r.distance <= maxDist)
     log.info("recallPlays gated", {
       total: rows.length,
       kept: gated.length,
       maxDist,
       distances: rows.map((r) => (r.distance == null ? null : Number(r.distance.toFixed(3)))),
     })
-    if (input.excludeSessionId) playsBySession.set(input.excludeSessionId, gated)
+    if (input.excludeSessionId) rememberPlays(input.excludeSessionId, gated)
     return gated
   } catch (e) {
     log.warn("recallPlays failed", { err: e })
