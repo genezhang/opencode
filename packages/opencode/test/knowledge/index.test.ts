@@ -579,6 +579,125 @@ describe("recallPlays NULL-distance fail-closed (PR #19 review #3)", () => {
   })
 })
 
+describe("renderPlayContent escapes edit preview (PR #19 review #10)", () => {
+  test("XML metacharacters in newString are escaped so they can't break the play tag wrapper", async () => {
+    // Code snippets routinely contain `<`, `>`, `&` (generics, JSX, comparisons,
+    // closing tags). Without escaping, an edit like `</zengram-previously-helpful>`
+    // could break out of the surrounding tag in formatPlaysBlock.
+    let captured = ""
+    const dispatchClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        if (sql.includes("FROM turn") && sql.includes("role = 'user'")) return [{ id: "msg_1" }] as any
+        if (sql.includes("FROM part") && sql.includes("type = 'text'"))
+          return [{ data: { text: "x".repeat(40) } }] as any
+        if (sql.includes("FROM workspace_file"))
+          return [{ file_path: "/repo/foo.tsx", understanding: "deep", edit_state: "modified", relevance: 1 }] as any
+        if (sql.includes("FROM part") && sql.includes("type = 'tool'")) {
+          return [{
+            data: {
+              tool: "edit",
+              state: {
+                status: "completed",
+                input: {
+                  filePath: "/repo/foo.tsx",
+                  oldString: "old",
+                  newString: "if (a < b && c > 0) { return </tag> }",
+                },
+              },
+            },
+          }] as any
+        }
+        if (sql.includes("FROM knowledge")) return [] as any
+        return [] as any
+      },
+      execute: async (_sql: string, params?: unknown[]) => {
+        // Capture the `content` parameter from the INSERT (5th positional, index 4).
+        if (params && params.length >= 5 && typeof params[4] === "string") captured = params[4] as string
+        return 0
+      },
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+    await recordPlay({ projectId: "proj_test" as any, sessionId: "ses_test" as any })
+    expect(captured).not.toContain("<")
+    expect(captured).not.toContain("</tag>")
+    expect(captured).toContain("&lt;")
+    expect(captured).toContain("&gt;")
+    expect(captured).toContain("&amp;")
+  })
+})
+
+describe("buildEditChanges multiedit shape (PR #19 review #11)", () => {
+  test("multiedit's input.edits[] array is iterated, not its (absent) top-level oldString/newString", async () => {
+    // multiedit's schema is { filePath, edits: [{oldString, newString, ...}] }.
+    // The pre-fix code looked for input.oldString/newString at the top level
+    // and silently produced no captured diff for any multiedit call.
+    let captured = ""
+    const dispatchClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        if (sql.includes("FROM turn") && sql.includes("role = 'user'")) return [{ id: "msg_1" }] as any
+        if (sql.includes("FROM part") && sql.includes("type = 'text'"))
+          return [{ data: { text: "x".repeat(40) } }] as any
+        if (sql.includes("FROM workspace_file"))
+          return [{ file_path: "/repo/m.py", understanding: "deep", edit_state: "modified", relevance: 1 }] as any
+        if (sql.includes("FROM part") && sql.includes("type = 'tool'")) {
+          return [{
+            data: {
+              tool: "multiedit",
+              state: {
+                status: "completed",
+                input: {
+                  filePath: "/repo/m.py",
+                  edits: [
+                    { oldString: "first_old", newString: "first_new_change" },
+                    { oldString: "second_old", newString: "second_new_change" },
+                  ],
+                },
+              },
+            },
+          }] as any
+        }
+        if (sql.includes("FROM knowledge")) return [] as any
+        return [] as any
+      },
+      execute: async (_sql: string, params?: unknown[]) => {
+        if (params && params.length >= 5 && typeof params[4] === "string") captured = params[4] as string
+        return 0
+      },
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+    await recordPlay({ projectId: "proj_test" as any, sessionId: "ses_test" as any })
+    expect(captured).toContain("first_new_change")
+    expect(captured).toContain("second_new_change")
+  })
+})
+
+describe("recallPlays cache invalidates on queryText change (PR #19 review #12)", () => {
+  test("cache returns memoized plays when queryText matches; re-fires when it changes", async () => {
+    let querySqlCount = 0
+    const dispatchClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        if (sql.includes("FROM knowledge") && sql.includes("<-> embed")) {
+          querySqlCount++
+          return [
+            { id: "knw_x", subject: "[s] near", content: "files: x.py", source_session: null, importance: 0.8, distance: 0.1 },
+          ] as any
+        }
+        return [] as any
+      },
+      execute: async () => 0,
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+    const sessionId = "ses_cache_test" as any
+    await recallPlays({ projectId: "proj_test" as any, problem: "first problem text long enough to pass min", excludeSessionId: sessionId })
+    await recallPlays({ projectId: "proj_test" as any, problem: "first problem text long enough to pass min", excludeSessionId: sessionId })
+    // Second call with same problem hits the cache → no extra SQL.
+    expect(querySqlCount).toBe(1)
+    await recallPlays({ projectId: "proj_test" as any, problem: "totally different follow-up question from user now", excludeSessionId: sessionId })
+    // Different problem → cache miss → SQL fires again.
+    expect(querySqlCount).toBe(2)
+  })
+})
+
 describe("recordPlay subject-vs-content fast-path (PR #19 review #2)", () => {
   test("re-writes when subject changes even if content stays identical", async () => {
     // Early recordPlay can hit resolveProblem's session.title fallback,

@@ -66,13 +66,23 @@ export function initEmbedded(dataDir: string, mode: "lsm" | "btree" = "lsm"): vo
   log.info("embedded zeta ready")
 }
 
+function expandHome(p: string): string {
+  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(homedir(), p.slice(2))
+  if (p === "~") return homedir()
+  if (p.startsWith("$HOME/") || p.startsWith("$HOME\\")) return path.join(homedir(), p.slice(6))
+  return p
+}
+
 function registerLocalEmbed(db: Database): void {
   if (typeof db.useLocalEmbed !== "function") {
     log.info("embed(): useLocalEmbed not present — binding built without local-embed feature")
     return
   }
   const explicit = process.env["OPENCODE_EMBED_MODEL_DIR"]
-  const candidate = explicit ?? path.join(homedir(), "embed")
+  // Expand `~/` and `$HOME` so users can write `OPENCODE_EMBED_MODEL_DIR=~/embed`
+  // or `=$HOME/embed` like everywhere else in the codebase (config/paths.ts,
+  // permission/index.ts, session/instruction.ts, tool/bash.ts all do the same).
+  const candidate = explicit ? expandHome(explicit) : path.join(homedir(), "embed")
   if (!existsSync(path.join(candidate, "model.onnx")) || !existsSync(path.join(candidate, "vocab.txt"))) {
     if (explicit) log.warn("OPENCODE_EMBED_MODEL_DIR missing model.onnx/vocab.txt", { dir: candidate })
     else log.info("embed(): no model dir found, skipping local-embed registration", { tried: candidate })

@@ -723,7 +723,13 @@ function renderPlayContent(
   if (edits.length > 0) {
     for (const e of edits) {
       lines.push(`In ${sanitizePath(toRepoRelative(e.file, rootDir))} the working change was:`)
-      lines.push(`  ${truncateForPlay(e.newString)}`)
+      // Escape the edit preview the same way as paths — code snippets routinely
+      // contain `<`, `>`, `&` (generics, JSX, comparisons) which would otherwise
+      // break out of the <zengram-previously-helpful> tag wrapper applied by
+      // formatPlaysBlock. sanitizePath despite the name is a generic
+      // XML-block escaper; truncateForPlay already collapsed whitespace so the
+      // newline stripping is a no-op here.
+      lines.push(`  ${sanitizePath(truncateForPlay(e.newString))}`)
     }
   }
   return lines.join("\n")
@@ -794,7 +800,7 @@ async function buildEditChanges(
     [sessionId],
   )
   const out: EditChange[] = []
-  for (const r of rows) {
+  outer: for (const r of rows) {
     const parsed = typeof r.data === "string" ? safeParse(r.data) : r.data
     if (!parsed || typeof parsed !== "object") continue
     const partRec = parsed as Record<string, unknown>
@@ -808,6 +814,16 @@ async function buildEditChanges(
     if (!file) continue
     if (tool === "write" && typeof inp.content === "string") {
       out.push({ file, oldString: "", newString: inp.content })
+    } else if (tool === "multiedit" && Array.isArray(inp.edits)) {
+      // multiedit's schema is { filePath, edits: [{oldString, newString, ...}] }.
+      // Each entry is a discrete edit; surface them individually so plays show
+      // the same "the working change was: <preview>" per edit as plain edit calls.
+      for (const e of inp.edits as Array<Record<string, unknown>>) {
+        if (typeof e?.oldString !== "string" || typeof e?.newString !== "string") continue
+        out.push({ file, oldString: e.oldString, newString: e.newString })
+        if (out.length >= EDIT_CAPTURE_MAX) break outer
+      }
+      continue
     } else if (typeof inp.oldString === "string" && typeof inp.newString === "string") {
       out.push({ file, oldString: inp.oldString, newString: inp.newString })
     }
@@ -959,12 +975,16 @@ async function resolveProblem(db: Queryable, sessionId: SessionID): Promise<stri
  * This matters during a single session: recordPlay fires on every turn and
  * would otherwise surface the current session's own file list as a "hint".
  */
-// Per-session memo so plays-block content stays byte-stable across turns.
-// llama.cpp's prefix KV cache only reuses if the prompt prefix matches
-// exactly; if recall returned a different (or differently-ordered) set on
-// turn N+1, every subsequent turn paid full prompt-processing cost. Plays
-// are global state from the perspective of one session — they don't change
-// mid-session — so we resolve once per session and reuse.
+// Per-session memo so plays-block content stays byte-stable within the
+// lifetime of one user message. llama.cpp's prefix KV cache only reuses if
+// the prompt prefix matches exactly; if recall returned a different
+// (or differently-ordered) set during the same user turn, prompt-processing
+// cost would be paid in full each call.
+//
+// Keyed by (sessionId, queryText) — when the user posts a follow-up message
+// the queryText changes and recall correctly re-fires. Keying by sessionId
+// alone (an earlier shape) cached too aggressively and returned stale plays
+// for the original problem after the user moved on.
 //
 // FIFO-bounded so long-running modes (`opencode serve`) don't accumulate
 // entries indefinitely. Capacity 64 is an order of magnitude larger than
@@ -973,13 +993,13 @@ async function resolveProblem(db: Queryable, sessionId: SessionID): Promise<stri
 // — both acceptable. JS Map preserves insertion order, so the first key is
 // the oldest entry.
 const PLAYS_CACHE_MAX = 64
-const playsBySession = new Map<SessionID, PlayEntry[]>()
-function rememberPlays(sessionId: SessionID, plays: PlayEntry[]): void {
+const playsBySession = new Map<SessionID, { queryText: string; plays: PlayEntry[] }>()
+function rememberPlays(sessionId: SessionID, queryText: string, plays: PlayEntry[]): void {
   if (playsBySession.size >= PLAYS_CACHE_MAX && !playsBySession.has(sessionId)) {
     const oldest = playsBySession.keys().next().value
     if (oldest !== undefined) playsBySession.delete(oldest)
   }
-  playsBySession.set(sessionId, plays)
+  playsBySession.set(sessionId, { queryText, plays })
 }
 
 // Similarity gate: drop plays whose L2 distance to the current problem
@@ -1006,10 +1026,6 @@ export async function recallPlays(input: {
   limit?: number
 }): Promise<PlayEntry[]> {
   if (!input.problem || input.problem.length < 20) return []
-  if (input.excludeSessionId) {
-    const cached = playsBySession.get(input.excludeSessionId)
-    if (cached) return cached
-  }
   // Strip a leading bench/agent preamble before embedding the query.
   // Symptom we saw on the dj-12713/dj-14089 suite: a fixed ~1.5KB BENCH_PREAMBLE
   // is prepended to every problem, so embed(userText) gets dominated by the
@@ -1020,6 +1036,14 @@ export async function recallPlays(input: {
   // when present and is a no-op when absent.
   const sepIdx = input.problem.lastIndexOf("\n---\n")
   const queryText = sepIdx >= 0 ? input.problem.slice(sepIdx + 5).trim() : input.problem
+  // Cache lookup AFTER queryText is computed, so the cache key matches what
+  // would have driven the embedding query. Only return cached plays when both
+  // the session AND the problem text match — same session with a follow-up
+  // user message must re-fire recall.
+  if (input.excludeSessionId) {
+    const cached = playsBySession.get(input.excludeSessionId)
+    if (cached && cached.queryText === queryText) return cached.plays
+  }
   const db = zengramDb()
   const limit = Math.min(input.limit ?? 3, 10)
   const now = Date.now() * 1000
@@ -1056,7 +1080,7 @@ export async function recallPlays(input: {
       maxDist,
       distances: rows.map((r) => (r.distance == null ? null : Number(r.distance.toFixed(3)))),
     })
-    if (input.excludeSessionId) rememberPlays(input.excludeSessionId, gated)
+    if (input.excludeSessionId) rememberPlays(input.excludeSessionId, queryText, gated)
     return gated
   } catch (e) {
     log.warn("recallPlays failed", { err: e })
