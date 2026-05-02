@@ -6,7 +6,7 @@
  */
 
 import { generateText } from "ai"
-import { zengramDb } from "@/storage/db.zengram"
+import { zengramDb, type Queryable } from "@/storage/db.zengram"
 import { ulid } from "ulid"
 import { Log } from "@/util/log"
 import { Provider } from "@/provider/provider"
@@ -681,6 +681,7 @@ export type PlayEntry = {
   content: string       // rendered file list
   source_session: string | null
   importance: number
+  distance?: number     // L2 distance to query embedding; lower = more similar
 }
 
 const PLAY_SCOPE = "/play"
@@ -693,23 +694,184 @@ function playSubjectForSession(sessionId: string, problem: string): string {
   return `[${sessionId}] ${excerpt}`
 }
 
-function renderPlayContent(files: WorkspaceFileEntry[]): string {
-  const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
-  const deepRead = files.filter((f) => f.edit_state !== "modified" && f.understanding === "deep")
+interface EditChange {
+  file: string
+  oldString: string
+  newString: string
+}
 
+function renderPlayContent(
+  files: WorkspaceFileEntry[],
+  sketch: string[],
+  edits: EditChange[],
+  rootDir?: string,
+): string {
+  // Compact format: a play is most useful as a "go look at THIS file" pointer
+  // plus a hint at the diff shape. Tool-sequence narrative ("grep → read →
+  // edit") and deep-read file lists added bytes without changing model
+  // behavior in the bench (still 5–6 turns regardless), and every byte hurts
+  // the prefix KV cache. Keep file list + diff preview only.
+  const modified = files.filter((f) => f.edit_state === "modified" || f.edit_state === "deleted")
+  // Fall back to deriving the modified-file list from edits when workspace_file
+  // hasn't projected yet — same race as the tool_call lag we work around in
+  // buildEditChanges. Each edit's filePath is enough to surface "look here".
+  const modifiedPaths: string[] = modified.length > 0
+    ? modified.map((f) => `${sanitizePath(toRepoRelative(f.file_path, rootDir))}${f.edit_state === "deleted" ? " (deleted)" : ""}`)
+    : Array.from(new Set(edits.map((e) => sanitizePath(toRepoRelative(e.file, rootDir)))))
   const lines: string[] = []
-  if (modified.length > 0) {
-    lines.push("Files modified to solve the problem:")
-    for (const f of modified) {
-      const tag = f.edit_state === "deleted" ? " (deleted)" : ""
-      lines.push(`  - ${sanitizePath(f.file_path)}${tag}`)
+  if (modifiedPaths.length > 0) lines.push(`Files modified: ${modifiedPaths.join(", ")}`)
+  if (edits.length > 0) {
+    for (const e of edits) {
+      lines.push(`In ${sanitizePath(toRepoRelative(e.file, rootDir))} the working change was:`)
+      lines.push(`  ${truncateForPlay(e.newString)}`)
     }
   }
-  if (deepRead.length > 0) {
-    lines.push("Files read closely (not modified):")
-    for (const f of deepRead.slice(0, 10)) lines.push(`  - ${sanitizePath(f.file_path)}`)
-  }
+  // sketch and deep-read intentionally dropped — see comment above.
+  void sketch
   return lines.join("\n")
+}
+
+const EDIT_PREVIEW_MAX = 600
+
+function truncateForPlay(s: string): string {
+  const collapsed = s.replace(/\s+/g, " ").trim()
+  return collapsed.length > EDIT_PREVIEW_MAX
+    ? collapsed.slice(0, EDIT_PREVIEW_MAX - 3) + "..."
+    : collapsed
+}
+
+function toRepoRelative(file: string, rootDir?: string): string {
+  if (!rootDir) return file
+  const prefix = rootDir.endsWith("/") ? rootDir : rootDir + "/"
+  return file.startsWith(prefix) ? file.slice(prefix.length) : file
+}
+
+/**
+ * Build a compact tool-call sketch for a session — an ordered, deduplicated
+ * list like `grep(migrations) → read(autodetector.py) → edit(autodetector.py)`.
+ * Caps at 12 steps so we don't bloat the prompt on long sessions.
+ */
+const SKETCH_MAX_STEPS = 12
+const SKETCH_FILE_ARG_KEYS = ["filePath", "path", "file", "pattern"] as const
+// Shell commands that tell the model nothing about the problem structure
+// (directory hopping, env probing, file existence checks). Drop them so
+// the sketch stays focused on productive steps.
+const BASH_NOISE_HEADS = new Set([
+  "cd", "ls", "pwd", "which", "echo", "env", "printenv", "clear", "true", "false",
+])
+
+async function buildToolSketch(
+  db: Queryable,
+  sessionId: SessionID,
+  rootDir?: string,
+): Promise<string[]> {
+  const rows = await db.query<{ tool_id: string; input: any }>(
+    `SELECT tool_id, input FROM tool_call
+     WHERE session_id = $1 AND state = 'completed'
+     ORDER BY time_created ASC`,
+    [sessionId],
+  )
+  const steps: string[] = []
+  let prev = ""
+  for (const r of rows) {
+    const tool = r.tool_id || "tool"
+    const raw = r.input
+    const parsed = typeof raw === "string" ? safeParse(raw) : raw
+    if (isNoiseStep(tool, parsed)) continue
+    const argStr = describeToolInput(tool, parsed, rootDir)
+    const step = argStr ? `${tool}(${argStr})` : tool
+    if (step === prev) continue // collapse immediate repeats
+    steps.push(step)
+    prev = step
+    if (steps.length >= SKETCH_MAX_STEPS) break
+  }
+  return steps
+}
+
+function isNoiseStep(tool: string, input: unknown): boolean {
+  if (tool !== "bash") return false
+  if (!input || typeof input !== "object") return false
+  const cmd = (input as Record<string, unknown>)["command"]
+  if (typeof cmd !== "string") return false
+  const head = cmd.trim().split(/\s+/)[0] ?? ""
+  return BASH_NOISE_HEADS.has(head.toLowerCase())
+}
+
+function safeParse(s: string): unknown {
+  try { return JSON.parse(s) } catch { return null }
+}
+
+function describeToolInput(tool: string, input: unknown, rootDir?: string): string {
+  if (!input || typeof input !== "object") return ""
+  const rec = input as Record<string, unknown>
+  for (const key of SKETCH_FILE_ARG_KEYS) {
+    const v = rec[key]
+    if (typeof v === "string" && v.length > 0) {
+      const short = toRepoRelative(v, rootDir)
+      // For bash, show the first word of the command rather than the whole thing.
+      if (tool === "bash" && key === "pattern") return short
+      return short.length > 60 ? short.slice(0, 57) + "..." : short
+    }
+  }
+  // bash's command lives under `command`; show its head.
+  if (tool === "bash" && typeof rec["command"] === "string") {
+    const head = (rec["command"] as string).trim().split(/\s+/)[0] ?? ""
+    return head.slice(0, 20)
+  }
+  return ""
+}
+
+/**
+ * Fetch the edits that actually landed in this session. Each `edit` /
+ * `multiedit` tool call carries `{filePath, oldString, newString}` in its
+ * input — that's the structured diff we want to surface to future sessions.
+ * Caps the total return at EDIT_CAPTURE_MAX edits so a runaway edit loop
+ * doesn't blow up the play content.
+ */
+const EDIT_CAPTURE_MAX = 3
+
+async function buildEditChanges(
+  db: Queryable,
+  sessionId: SessionID,
+): Promise<EditChange[]> {
+  // Query the `part` table, not `tool_call`. Parts are written synchronously
+  // when each tool result arrives, so they're visible to recordPlay's
+  // fire-and-forget reads on the very next turn. tool_call is projected from
+  // a different event and the dj-12713 sweep showed it could lag enough that
+  // short sessions (3–6 tool calls, edit near the end) finish before the
+  // edit row commits — leaving plays with file paths only.
+  //
+  // Each tool-call part stores the call as JSON in `data`:
+  //   { state: { input: {filePath, oldString, newString | content}, ... }, ... }
+  // The `tool` field on the JSON tells us which tool was invoked.
+  const rows = await db.query<{ data: any }>(
+    `SELECT p.data FROM part p
+     JOIN turn t ON p.turn_id = t.id
+     WHERE t.session_id = $1 AND p.type = 'tool'
+     ORDER BY t.time_created ASC, p.position ASC`,
+    [sessionId],
+  )
+  const out: EditChange[] = []
+  for (const r of rows) {
+    const parsed = typeof r.data === "string" ? safeParse(r.data) : r.data
+    if (!parsed || typeof parsed !== "object") continue
+    const partRec = parsed as Record<string, unknown>
+    const tool = typeof partRec.tool === "string" ? partRec.tool : ""
+    if (tool !== "edit" && tool !== "multiedit" && tool !== "write") continue
+    const state = partRec.state as Record<string, unknown> | undefined
+    if (!state || (state.status !== "completed" && state.status !== "success")) continue
+    const inp = state.input as Record<string, unknown> | undefined
+    if (!inp) continue
+    const file = typeof inp.filePath === "string" ? inp.filePath : ""
+    if (!file) continue
+    if (tool === "write" && typeof inp.content === "string") {
+      out.push({ file, oldString: "", newString: inp.content })
+    } else if (typeof inp.oldString === "string" && typeof inp.newString === "string") {
+      out.push({ file, oldString: inp.oldString, newString: inp.newString })
+    }
+    if (out.length >= EDIT_CAPTURE_MAX) break
+  }
+  return out
 }
 
 /**
@@ -725,37 +887,26 @@ function renderPlayContent(files: WorkspaceFileEntry[]): string {
 export async function recordPlay(input: {
   projectId: ProjectID
   sessionId: SessionID
+  rootDir?: string
 }): Promise<void> {
   try {
     const db = zengramDb()
     const now = Date.now() * 1000
 
-    // Problem statement: the first user-message text part for this session.
-    // We split this into two queries deliberately — an equivalent JOIN query
-    // (`SELECT p.data FROM part p JOIN turn t ON t.id = p.turn_id WHERE
-    // t.session_id = $1 AND t.role = 'user' AND p.type = 'text'`) silently
-    // returns rows with `p.*` columns undefined on embedded Zeta. Two queries
-    // sidestep that bug and cost one extra round-trip in a fire-and-forget path.
-    const firstUserTurn = await db.query<{ id: string }>(
-      `SELECT id FROM turn
-       WHERE session_id = $1 AND role = 'user'
-       ORDER BY time_created ASC
-       LIMIT 1`,
-      [input.sessionId],
-    )
-    if (firstUserTurn.length === 0) return
-    const firstUserParts = await db.query<{ data: any }>(
-      `SELECT data FROM part
-       WHERE turn_id = $1 AND type = 'text'
-       ORDER BY position ASC
-       LIMIT 1`,
-      [firstUserTurn[0].id],
-    )
-    if (firstUserParts.length === 0) return
-    const raw = firstUserParts[0].data
-    const data = typeof raw === "string" ? JSON.parse(raw) : raw
-    const problem = (data as { text?: string } | null)?.text ?? ""
-    if (problem.length < 20) return
+    // Problem statement: the first user-message text part for this session,
+    // with the session.title as a fallback when the user-turn row isn't
+    // visible yet (projectAsync ordering isn't guaranteed — we've seen
+    // recordPlay fire on an assistant-finish before the user turn's
+    // MessageV2.Event.Updated projector committed).
+    //
+    // We split the user-turn/part lookup into two queries deliberately — an
+    // equivalent JOIN silently returns rows with `p.*` columns undefined on
+    // embedded Zeta; two queries sidestep that bug in a fire-and-forget path.
+    const problem = await resolveProblem(db, input.sessionId)
+    if (!problem || problem.length < 20) {
+      log.info("recordPlay skipped: short problem", { sessionId: input.sessionId, len: problem?.length ?? 0 })
+      return
+    }
 
     const files = await db.query<WorkspaceFileEntry>(
       `SELECT file_path, understanding, edit_state, relevance
@@ -766,8 +917,15 @@ export async function recordPlay(input: {
          CASE understanding WHEN 'deep' THEN 0 WHEN 'read' THEN 1 ELSE 2 END`,
       [input.sessionId],
     )
-    const content = renderPlayContent(files)
-    if (content.length === 0) return // no modified / deep-read files → nothing useful
+    const [sketch, edits] = await Promise.all([
+      buildToolSketch(db, input.sessionId, input.rootDir),
+      buildEditChanges(db, input.sessionId),
+    ])
+    const content = renderPlayContent(files, sketch, edits, input.rootDir)
+    if (content.length === 0) {
+      log.info("recordPlay skipped: no useful files", { sessionId: input.sessionId, fileRows: files.length })
+      return
+    }
 
     const subject = playSubjectForSession(input.sessionId, problem)
 
@@ -777,6 +935,17 @@ export async function recordPlay(input: {
     // our own prior INSERT to the same-session SELECT, producing duplicate
     // rows instead of updating).
     const id = `knw_play_${input.sessionId}`
+
+    // Skip the write (and the expensive re-embed) when nothing changed.
+    // recordPlay fires on every assistant finish; most of those don't
+    // produce new files or edits.
+    const existing = await db.query<{ content: string }>(
+      `SELECT content FROM knowledge WHERE id = $1`,
+      [id],
+    )
+    if (existing.length > 0 && existing[0].content === content) {
+      return
+    }
     await db.execute(
       `INSERT INTO knowledge
          (id, project_id, scope, subject, content, source_type, source_session,
@@ -795,9 +964,47 @@ export async function recordPlay(input: {
       `UPDATE knowledge SET embedding = embed(subject || '. ' || content) WHERE id = $1`,
       [id],
     ).catch((e) => log.warn("play embedding refresh failed", { err: e }))
+    log.info("recordPlay wrote", { sessionId: input.sessionId, id, contentLen: content.length })
   } catch (err) {
     log.warn("recordPlay failed", { sessionId: input.sessionId, err })
   }
+}
+
+/**
+ * Resolve the user-provided problem statement for a session. Preferred path
+ * is the first user turn's text part; falls back to session.title when the
+ * user-turn row isn't visible yet (event-ordering race during very early
+ * recordPlay calls). Returns empty string if nothing usable.
+ */
+async function resolveProblem(db: Queryable, sessionId: SessionID): Promise<string> {
+  const firstUserTurn = await db.query<{ id: string }>(
+    `SELECT id FROM turn
+     WHERE session_id = $1 AND role = 'user'
+     ORDER BY time_created ASC
+     LIMIT 1`,
+    [sessionId],
+  )
+  if (firstUserTurn.length > 0) {
+    const parts = await db.query<{ data: any }>(
+      `SELECT data FROM part
+       WHERE turn_id = $1 AND type = 'text'
+       ORDER BY position ASC
+       LIMIT 1`,
+      [firstUserTurn[0].id],
+    )
+    if (parts.length > 0) {
+      const raw = parts[0].data
+      const decoded = typeof raw === "string" ? (safeParse(raw) as { text?: string } | null) : raw
+      const text = (decoded as { text?: string } | null)?.text ?? ""
+      if (text.length >= 20) return text
+    }
+  }
+  // Fallback: session.title is populated early and survives projector races.
+  const sessRows = await db.query<{ title: string | null }>(
+    `SELECT title FROM session WHERE id = $1 LIMIT 1`,
+    [sessionId],
+  )
+  return sessRows[0]?.title ?? ""
 }
 
 /**
@@ -809,6 +1016,31 @@ export async function recordPlay(input: {
  * This matters during a single session: recordPlay fires on every turn and
  * would otherwise surface the current session's own file list as a "hint".
  */
+// Per-session memo so plays-block content stays byte-stable across turns.
+// llama.cpp's prefix KV cache only reuses if the prompt prefix matches
+// exactly; if recall returned a different (or differently-ordered) set on
+// turn N+1, every subsequent turn paid full prompt-processing cost. Plays
+// are global state from the perspective of one session — they don't change
+// mid-session — so we resolve once per session and reuse.
+const playsBySession = new Map<SessionID, PlayEntry[]>()
+
+// Similarity gate: drop plays whose L2 distance to the current problem
+// embedding exceeds this. Empirical observation on this codebase with
+// BGE-small embeddings: same problem ≈ 0.1–0.2, same Django subsystem ≈
+// 0.4–0.5, cross-domain Django (e.g. admin vs datastructures) ≈ 0.60+.
+// Default 0.5 keeps same-task and tightly-related plays, drops cross-domain
+// Django plays — verified on the dj-14089 ↔ dj-12713 pair where unrelated
+// plays surfaced at distance ≈ 0.61 with no behavioral upside.
+// Override via ZENGRAM_PLAY_MAX_DISTANCE for tuning.
+const PLAY_DISTANCE_DEFAULT = 0.5
+
+function playDistanceMax(): number {
+  const raw = process.env["ZENGRAM_PLAY_MAX_DISTANCE"]
+  if (!raw) return PLAY_DISTANCE_DEFAULT
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : PLAY_DISTANCE_DEFAULT
+}
+
 export async function recallPlays(input: {
   projectId: ProjectID
   problem: string
@@ -816,15 +1048,32 @@ export async function recallPlays(input: {
   limit?: number
 }): Promise<PlayEntry[]> {
   if (!input.problem || input.problem.length < 20) return []
+  if (input.excludeSessionId) {
+    const cached = playsBySession.get(input.excludeSessionId)
+    if (cached) return cached
+  }
+  // Strip a leading bench/agent preamble before embedding the query.
+  // Symptom we saw on the dj-12713/dj-14089 suite: a fixed ~1.5KB BENCH_PREAMBLE
+  // is prepended to every problem, so embed(userText) gets dominated by the
+  // preamble bytes — making cross-task and same-task queries land at almost
+  // identical distances (~0.61) and breaking the similarity gate. The
+  // convention in the preamble is "<instructions>\n\n---\n\n<problem>", so
+  // splitting on the LAST `---` separator pulls out the task-specific tail
+  // when present and is a no-op when absent.
+  const sepIdx = input.problem.lastIndexOf("\n---\n")
+  const queryText = sepIdx >= 0 ? input.problem.slice(sepIdx + 5).trim() : input.problem
   const db = zengramDb()
   const limit = Math.min(input.limit ?? 3, 10)
   const now = Date.now() * 1000
+  const maxDist = playDistanceMax()
 
   try {
-    // Validity predicate matches recallFacts — plays share the knowledge table,
-    // so an expired play must not leak back in just because it's a play.
+    // Pull distance alongside the row so we can gate in JS — Zeta has shown
+    // edge cases where a SQL-level WHERE on `embedding <-> embed(...)`
+    // misbehaves; computing once and filtering JS-side is robust.
     const rows = await db.query<PlayEntry>(
-      `SELECT id, subject, content, source_session, importance
+      `SELECT id, subject, content, source_session, importance,
+              (embedding <-> embed($5)) AS distance
        FROM knowledge
        WHERE project_id = $1
          AND scope = $2
@@ -832,11 +1081,19 @@ export async function recallPlays(input: {
          AND (valid_to IS NULL OR valid_to > $3)
          AND embedding IS NOT NULL
          AND ($4::text IS NULL OR source_session IS NULL OR source_session != $4)
-       ORDER BY (embedding <-> embed($5)) ASC
+       ORDER BY distance ASC
        LIMIT ${limit}`,
-      [input.projectId, PLAY_SCOPE, now, input.excludeSessionId ?? null, input.problem],
+      [input.projectId, PLAY_SCOPE, now, input.excludeSessionId ?? null, queryText],
     )
-    return rows
+    const gated = rows.filter((r) => r.distance == null || r.distance <= maxDist)
+    log.info("recallPlays gated", {
+      total: rows.length,
+      kept: gated.length,
+      maxDist,
+      distances: rows.map((r) => (r.distance == null ? null : Number(r.distance.toFixed(3)))),
+    })
+    if (input.excludeSessionId) playsBySession.set(input.excludeSessionId, gated)
+    return gated
   } catch (e) {
     log.warn("recallPlays failed", { err: e })
     return []

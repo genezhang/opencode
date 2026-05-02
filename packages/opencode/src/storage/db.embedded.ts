@@ -17,6 +17,9 @@
 
 import * as zetaDb from "zeta-db"
 import type { Database } from "zeta-db"
+import { existsSync } from "node:fs"
+import { homedir } from "node:os"
+import path from "node:path"
 import { type Queryable, setZengramClient } from "./db.zengram"
 import { Log } from "@/util/log"
 
@@ -57,9 +60,33 @@ export function initEmbedded(dataDir: string, mode: "lsm" | "btree" = "lsm"): vo
   log.info("opening embedded zeta", { dataDir, mode })
   const db = dataDir === ":memory:" ? zetaDb.open(":memory:") : zetaDb.open(dataDir, mode)
   if (!db) throw new Error(`zetaDb.open failed for ${dataDir}`)
+  registerLocalEmbed(db)
   _db = db
   setZengramClient(new EmbeddedClient(db))
   log.info("embedded zeta ready")
+}
+
+function registerLocalEmbed(db: Database): void {
+  if (typeof db.useLocalEmbed !== "function") {
+    log.info("embed(): useLocalEmbed not present — binding built without local-embed feature")
+    return
+  }
+  const explicit = process.env["OPENCODE_EMBED_MODEL_DIR"]
+  const candidate = explicit ?? path.join(homedir(), "embed")
+  if (!existsSync(path.join(candidate, "model.onnx")) || !existsSync(path.join(candidate, "vocab.txt"))) {
+    if (explicit) log.warn("OPENCODE_EMBED_MODEL_DIR missing model.onnx/vocab.txt", { dir: candidate })
+    else log.info("embed(): no model dir found, skipping local-embed registration", { tried: candidate })
+    return
+  }
+  try {
+    const dims = db.useLocalEmbed(candidate)
+    log.info("embed() provider registered (local ONNX)", { dir: candidate, dims })
+  } catch (err) {
+    log.warn("embed() local provider registration failed — keyword fallback active", {
+      dir: candidate,
+      err: err instanceof Error ? err.message : String(err),
+    })
+  }
 }
 
 /**

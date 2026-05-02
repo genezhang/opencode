@@ -206,6 +206,7 @@ export default [
       recordPlay({
         projectId: Instance.project.id,
         sessionId: info.sessionID,
+        rootDir: Instance.worktree,
       }).catch((err) => log.warn("recordPlay failed", { err }))
     }
   }),
@@ -267,7 +268,9 @@ export default [
             duration_ms, tokens_consumed, time_created, time_completed)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          ON CONFLICT (id) DO UPDATE SET
-           state = EXCLUDED.state, output = EXCLUDED.output, error = EXCLUDED.error,
+           state = EXCLUDED.state,
+           input = EXCLUDED.input,
+           output = EXCLUDED.output, error = EXCLUDED.error,
            duration_ms = EXCLUDED.duration_ms, tokens_consumed = EXCLUDED.tokens_consumed,
            time_completed = EXCLUDED.time_completed`,
         [
