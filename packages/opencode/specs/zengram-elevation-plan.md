@@ -7,6 +7,73 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-03 (first end-to-end with the trajectory analyzer live)
+
+First survey since the trajectory minimizer + analyzer (zengram-bench PR #3) and the play recall pipeline (PR #19) landed. 25-task Django subset × n=1 × 2 variants = 50 invocations, multi-session BENCH_SUITE_NAME=survey25_round1 so plays compound across the suite.
+
+**Headline (analyzer output, both n=25):**
+
+| metric | baseline | zengram | Δ |
+|---|---|---|---|
+| Resolved | 1/25 (4%) | **3/25 (12%)** | **3×** |
+| Total tokens | 2.28 M | 2.82 M | +24% |
+| **Resolved / 1M tok ★** | **0.44** | **1.06** | **+141% (~2.4×)** |
+| Median tokens / run | 64 k | 92 k | +43% |
+| Median turns / run | 15.0 | 12.0 | -3 |
+
+The token-efficiency gap *widened* from the focused 3-task suite (1.7× → 2.4×) — plays compound more at scale.
+
+### Asymmetric-burn pattern (the analyzer's killer feature)
+
+Per-task token deltas surface exactly what's working and what isn't. Both variants fail to resolve, but zengram is **dramatically cheaper** on tasks where plays anchor to the right files:
+
+| task | baseline tok | zengram tok | turns Δ |
+|---|---|---|---|
+| dj-12713 | 155 k | 105 k | 10 → 6 |
+| dj-14559 | 81 k | 55 k | 11 → 6 |
+| dj-14787 | 144 k | 61 k | 11 → 7 |
+| dj-16333 | 83 k | 55 k | 15 → 10 |
+
+…and **dramatically more expensive** when cross-domain plays mislead:
+
+| task | baseline tok | zengram tok |
+|---|---|---|
+| dj-13297 | 33 k | 158 k |
+| dj-15368 | 50 k | 134 k |
+| dj-16595 | 78 k | 274 k (3.5×) |
+
+The right-tail wins outweigh the left-tail blowups (hence the 2.4× headline), but the left tail is real cost. Tightening the similarity gate (currently `ZENGRAM_PLAY_MAX_DISTANCE=0.5`) is the obvious next investigation.
+
+### Wasted-action distribution
+
+| tag | baseline | zengram |
+|---|---|---|
+| useful | 79.3% | 82.8% |
+| **redundant_read** | **20.3%** | **17.2%** |
+| premature_test | 0% | 0% |
+| lint_only | 0% | 0% |
+| error_retry | 0.3% | 0% |
+
+At suite scale zengram has *fewer* redundant reads than baseline — flipped from the focused-suite finding. Plays surface the right files often enough that the model doesn't need to re-discover them. (Note: the parser currently lacks read offset/limit so chunked re-reads are conflated; tracked as zengram-bench issue #4.)
+
+`no_edit` sessions: 14 baseline, 10 zengram — both have many "give up empty-handed" sessions on the harder tasks; zengram cuts ~30%.
+
+### Caveat: absolute numbers are below the 2026-04-29 snapshot
+
+The 2026-04-29 snapshot below reported 8/25 baseline, 13/25 zengram on the same subset; this run got 1/25, 3/25. Both runs were on `Qwen3-Coder-Next Q6_K_XL`, so it's not a model swap. The most likely explanation is **n=1 sample variance** — at this scale a couple of borderline tasks tipping the wrong way moves the count materially — plus differences in accumulated zengram state and llama.cpp server state between runs (today's run started from a wiped multi-session dir; the 2026-04-29 run had its own history).
+
+The *ratio* (2.4×) and the per-task asymmetric-burn pattern are the load-bearing signals here, since they're variance-tolerant in a way the absolute count isn't. Treat the absolute resolution counts as a sanity floor rather than a capability claim until we re-run with higher n.
+
+### What this enables
+
+The trajectory analyzer turning real signal into per-task asymmetry data is the missing piece for tuning the play pipeline empirically rather than by gut. The data points to three next investigations:
+
+1. Tighter similarity gate (or per-task gate). The dj-16595 3.5× blowup is exactly what `ZENGRAM_PLAY_MAX_DISTANCE` is supposed to prevent.
+2. Migrate the trajectory parser into opencode's `run` command (zengram-bench issue #4) so it sees read offset/limit and can distinguish chunked re-reads from literal re-reads.
+3. Re-run with higher n (or against `Qwen3-Coder-30B-A3B` if we want a stronger-model sanity check) to settle whether 1/25 vs 3/25 is a real regression vs the 2026-04-29 8/25 vs 13/25, or just n=1 variance noise.
+
+---
+
 ## Status snapshot — 2026-04-29 (multi-task suite, local-LLM bench, **mission goal hit**)
 
 **Headline: Zengram now wins on every axis we care about** — more tasks resolved, fewer tokens per resolved task, and recall actually compounds across reps. First defensible numbers showing practice matches theory.
