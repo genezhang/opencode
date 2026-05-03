@@ -5,7 +5,7 @@ import { UI } from "../ui"
 import { cmd } from "./cmd"
 import { Flag } from "../../flag/flag"
 import { bootstrap } from "../bootstrap"
-import { EOL } from "os"
+import { EOL, homedir } from "os"
 import { Filesystem } from "../../util/filesystem"
 import { createOpencodeClient, type Message, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { Server } from "../../server/server"
@@ -502,7 +502,14 @@ export const RunCommand = cmd({
         if (state.status !== "completed" && state.status !== "error") return
         const input = (state.input ?? {}) as Record<string, unknown>
         const t = (state as unknown as { time?: { start?: number; end?: number } }).time ?? {}
-        const dur = t.start && t.end ? Math.max(0, t.end - t.start) : 0
+        // Explicit `typeof === "number"` checks rather than truthiness so a
+        // legitimate 0 timestamp (mocked clock, tool emitting epoch-relative
+        // 0-based timestamps) doesn't get silently treated as "missing" and
+        // collapsed to a 0 duration when it should be undefined-handled.
+        const dur =
+          typeof t.start === "number" && typeof t.end === "number"
+            ? Math.max(0, t.end - t.start)
+            : 0
         const output = state.status === "completed" ? (state as unknown as { output?: string }).output ?? "" : ""
         toolCounts[tool] = (toolCounts[tool] ?? 0) + 1
         records.push({
@@ -518,15 +525,31 @@ export const RunCommand = cmd({
           (typeof input.path === "string" ? input.path : undefined)
         if (tool === "read" && fp) fileTouch(fp).reads++
         else if ((tool === "edit" || tool === "write") && fp) fileTouch(fp).edits++
-        else if (tool === "bash" && typeof input.command === "string") {
+        else if (tool === "apply_patch" && state.status === "completed") {
+          // apply_patch is the codebase's primary patch-based editor (see
+          // ToolRegistry filtering); its completed-state metadata exposes a
+          // `files: [{filePath, type, ...}]` array. Surface those edits in
+          // files_touched so trajectories from apply_patch sessions don't
+          // misleadingly read as "no files touched". `type === "delete"`
+          // still counts as an edit (the file was modified — removed).
+          const meta = (state as unknown as { metadata?: { files?: Array<{ filePath?: string }> } }).metadata
+          for (const f of meta?.files ?? []) {
+            if (typeof f.filePath === "string" && f.filePath) fileTouch(f.filePath).edits++
+          }
+        } else if (tool === "bash" && typeof input.command === "string") {
           const cmd = input.command.slice(0, 80)
           if (cmd) bashCommands.push(cmd)
         }
       }
 
       async function writeTrajectoryIfRequested() {
-        const out = args["trajectory-json"] as string | undefined
-        if (!out) return
+        const raw = args["trajectory-json"] as string | undefined
+        if (!raw) return
+        // Expand `~/` and `$HOME` so quoted args / Windows shells / contexts
+        // where the shell didn't expand the tilde all work consistently with
+        // the rest of the codebase (config/paths.ts, permission/index.ts,
+        // tool/bash.ts:119, etc.).
+        const out = expandHome(raw)
         const filesArr = [...filesTouched.entries()]
           .map(([p, v]) => ({ path: p, ...v }))
           .sort((a, b) => (b.reads + b.edits) - (a.reads + a.edits))
@@ -537,11 +560,22 @@ export const RunCommand = cmd({
           records,
         }
         try {
-          await Bun.write(out, JSON.stringify(payload))
+          // Filesystem.write auto-creates parent directories on ENOENT so
+          // `--trajectory-json some/missing/dir/out.json` works. Centralises
+          // I/O on the codebase's helper rather than reaching for Bun.write
+          // directly.
+          await Filesystem.write(out, JSON.stringify(payload))
         } catch (e) {
           // Don't fail the run if trajectory write fails — log and continue.
           UI.error(`failed to write trajectory: ${e instanceof Error ? e.message : String(e)}`)
         }
+      }
+
+      function expandHome(p: string): string {
+        if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(homedir(), p.slice(2))
+        if (p === "~") return homedir()
+        if (p.startsWith("$HOME/") || p.startsWith("$HOME\\")) return path.join(homedir(), p.slice(6))
+        return p
       }
 
       const events = await sdk.event.subscribe()
@@ -735,7 +769,14 @@ export const RunCommand = cmd({
       }
       await share(sdk, sessionID)
 
-      loop().catch((e) => {
+      // Capture the loop promise instead of fire-and-forget. The loop awaits
+      // `writeTrajectoryIfRequested()` on session.status idle, but if we
+      // don't await the loop here, execute() returns the moment prompt()
+      // resolves and bootstrap's cleanup tears down the process before the
+      // trajectory write (especially its auto-mkdir branch on a missing
+      // parent dir) finishes its second await. Awaiting the loop ensures
+      // file I/O completes before exit.
+      const loopP = loop().catch((e) => {
         console.error(e)
         process.exit(1)
       })
@@ -759,6 +800,7 @@ export const RunCommand = cmd({
           parts: [...files, { type: "text", text: message }],
         })
       }
+      await loopP
     }
 
     if (args.attach) {
