@@ -58,17 +58,19 @@ At suite scale zengram has *fewer* redundant reads than baseline — flipped fro
 
 `no_edit` sessions: 14 baseline, 10 zengram — both have many "give up empty-handed" sessions on the harder tasks; zengram cuts ~30%.
 
-### Caveat: absolute numbers ≠ 2026-04-29 numbers
+### Caveat: absolute numbers are below the 2026-04-29 snapshot
 
-The 2026-04-29 snapshot below reported 8/25 baseline, 13/25 zengram on the same subset; this run got 1/25, 3/25. Difference is the model: 2026-04-29 used `Qwen3-Coder-30B-A3B-Instruct`, this run used `Qwen3-Coder-Next-UD-Q6_K_XL`. The Next variant appears notably less capable on this benchmark despite the name suggesting otherwise. The *ratio* (2.4×) and the per-task pattern are the load-bearing signal; absolute resolution rate isn't directly comparable across model swaps.
+The 2026-04-29 snapshot below reported 8/25 baseline, 13/25 zengram on the same subset; this run got 1/25, 3/25. Both runs were on `Qwen3-Coder-Next Q6_K_XL`, so it's not a model swap. The most likely explanation is **n=1 sample variance** — at this scale a couple of borderline tasks tipping the wrong way moves the count materially — plus differences in accumulated zengram state and llama.cpp server state between runs (today's run started from a wiped multi-session dir; the 2026-04-29 run had its own history).
+
+The *ratio* (2.4×) and the per-task asymmetric-burn pattern are the load-bearing signals here, since they're variance-tolerant in a way the absolute count isn't. Treat the absolute resolution counts as a sanity floor rather than a capability claim until we re-run with higher n.
 
 ### What this enables
 
-The trajectory analyzer turning real signal into per-task asymmetry data is the missing piece for tuning the play pipeline empirically rather than by gut. Next investigations the data points at:
+The trajectory analyzer turning real signal into per-task asymmetry data is the missing piece for tuning the play pipeline empirically rather than by gut. The data points to three next investigations:
 
 1. Tighter similarity gate (or per-task gate). The dj-16595 3.5× blowup is exactly what `ZENGRAM_PLAY_MAX_DISTANCE` is supposed to prevent.
 2. Migrate the trajectory parser into opencode's `run` command (zengram-bench issue #4) so it sees read offset/limit and can distinguish chunked re-reads from literal re-reads.
-3. Re-run on `Qwen3-Coder-30B-A3B` for direct comparison with the 2026-04-29 numbers — n=1 × 25 tasks is small enough that 1 vs 3 resolved is high variance; bigger n on a more capable model would settle whether the absolute drop is model-quality or a regression we're missing.
+3. Re-run with higher n (or against `Qwen3-Coder-30B-A3B` if we want a stronger-model sanity check) to settle whether 1/25 vs 3/25 is a real regression vs the 2026-04-29 8/25 vs 13/25, or just n=1 variance noise.
 
 ---
 
