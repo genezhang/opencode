@@ -302,6 +302,11 @@ export const RunCommand = cmd({
         describe: "show thinking blocks",
         default: false,
       })
+      .option("trajectory-json", {
+        type: "string",
+        describe:
+          "write a trajectory summary (tool calls, files touched, per-call records) to this path on session end",
+      })
   },
   handler: async (args) => {
     let message = [...args.message, ...(args["--"] || [])]
@@ -438,6 +443,107 @@ export const RunCommand = cmd({
         return false
       }
 
+      // Trajectory accumulator — populated by the loop below as tool calls
+      // resolve. Mirrors the schema zengram-bench reconstructs from the
+      // JSONL stream today; difference is each record carries the raw
+      // `input` object so downstream analyzers can see fields the bench
+      // parser had to flatten away (read offset/limit, multiedit edits[],
+      // etc.). Written only when --trajectory-json is set.
+      type TrajectoryRecord = {
+        turn: number
+        tool: string
+        input_summary: string
+        status: "completed" | "error"
+        duration_ms: number
+        output_chars: number
+        input: Record<string, unknown>
+      }
+      const trajectoryEnabled = !!args["trajectory-json"]
+      const toolCounts: Record<string, number> = {}
+      const filesTouched = new Map<string, { reads: number; edits: number }>()
+      const bashCommands: string[] = []
+      const records: TrajectoryRecord[] = []
+      let currentTurn = 0
+
+      function fileTouch(p: string) {
+        let entry = filesTouched.get(p)
+        if (!entry) {
+          entry = { reads: 0, edits: 0 }
+          filesTouched.set(p, entry)
+        }
+        return entry
+      }
+
+      function summarizeInput(tool: string, input: Record<string, unknown>): string {
+        const fp = (typeof input.filePath === "string" ? input.filePath : undefined) ??
+          (typeof input.path === "string" ? input.path : undefined)
+        if ((tool === "read" || tool === "edit" || tool === "write") && fp) return `path=${fp}`
+        if (tool === "bash") {
+          const cmd = typeof input.command === "string" ? input.command.slice(0, 80) : ""
+          return `cmd=${cmd}`
+        }
+        if (tool === "grep") {
+          const pat = typeof input.pattern === "string" ? input.pattern : ""
+          const where = typeof input.path === "string" ? input.path :
+            typeof input.include === "string" ? input.include : ""
+          return `pattern=${pat} path=${where}`.trim()
+        }
+        if (tool === "glob") return `pattern=${typeof input.pattern === "string" ? input.pattern : ""}`
+        if (tool === "codesearch")
+          return `q=${typeof input.query === "string" ? input.query : (typeof input.q === "string" ? input.q : "")}`
+        if (tool === "webfetch") return `url=${typeof input.url === "string" ? input.url : ""}`
+        return `keys=${Object.keys(input).filter((k) => !k.startsWith("_")).sort().join(",").slice(0, 80)}`
+      }
+
+      function recordToolCall(part: ToolPart) {
+        if (!trajectoryEnabled) return
+        const tool = part.tool
+        const state = part.state
+        if (state.status !== "completed" && state.status !== "error") return
+        const input = (state.input ?? {}) as Record<string, unknown>
+        const t = (state as unknown as { time?: { start?: number; end?: number } }).time ?? {}
+        const dur = t.start && t.end ? Math.max(0, t.end - t.start) : 0
+        const output = state.status === "completed" ? (state as unknown as { output?: string }).output ?? "" : ""
+        toolCounts[tool] = (toolCounts[tool] ?? 0) + 1
+        records.push({
+          turn: Math.max(currentTurn, 1),
+          tool,
+          input_summary: summarizeInput(tool, input),
+          status: state.status,
+          duration_ms: dur,
+          output_chars: typeof output === "string" ? output.length : 0,
+          input,
+        })
+        const fp = (typeof input.filePath === "string" ? input.filePath : undefined) ??
+          (typeof input.path === "string" ? input.path : undefined)
+        if (tool === "read" && fp) fileTouch(fp).reads++
+        else if ((tool === "edit" || tool === "write") && fp) fileTouch(fp).edits++
+        else if (tool === "bash" && typeof input.command === "string") {
+          const cmd = input.command.slice(0, 80)
+          if (cmd) bashCommands.push(cmd)
+        }
+      }
+
+      async function writeTrajectoryIfRequested() {
+        const out = args["trajectory-json"] as string | undefined
+        if (!out) return
+        const filesArr = [...filesTouched.entries()]
+          .map(([p, v]) => ({ path: p, ...v }))
+          .sort((a, b) => (b.reads + b.edits) - (a.reads + a.edits))
+        const payload = {
+          tool_counts: toolCounts,
+          files_touched: filesArr,
+          bash_commands: bashCommands,
+          records,
+        }
+        try {
+          await Bun.write(out, JSON.stringify(payload))
+        } catch (e) {
+          // Don't fail the run if trajectory write fails — log and continue.
+          UI.error(`failed to write trajectory: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+
       const events = await sdk.event.subscribe()
       let error: string | undefined
 
@@ -462,6 +568,7 @@ export const RunCommand = cmd({
             if (part.sessionID !== sessionID) continue
 
             if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+              recordToolCall(part)
               if (emit("tool_use", { part })) continue
               if (part.state.status === "completed") {
                 tool(part)
@@ -486,6 +593,7 @@ export const RunCommand = cmd({
             }
 
             if (part.type === "step-start") {
+              currentTurn++
               if (emit("step_start", { part })) continue
             }
 
@@ -538,6 +646,7 @@ export const RunCommand = cmd({
             event.properties.sessionID === sessionID &&
             event.properties.status.type === "idle"
           ) {
+            await writeTrajectoryIfRequested()
             break
           }
 
