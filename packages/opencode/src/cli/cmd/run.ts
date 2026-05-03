@@ -5,7 +5,7 @@ import { UI } from "../ui"
 import { cmd } from "./cmd"
 import { Flag } from "../../flag/flag"
 import { bootstrap } from "../bootstrap"
-import { EOL } from "os"
+import { EOL, homedir } from "os"
 import { Filesystem } from "../../util/filesystem"
 import { createOpencodeClient, type Message, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { Server } from "../../server/server"
@@ -302,6 +302,11 @@ export const RunCommand = cmd({
         describe: "show thinking blocks",
         default: false,
       })
+      .option("trajectory-json", {
+        type: "string",
+        describe:
+          "write a trajectory summary (tool calls, files touched, per-call records) to this path on session end",
+      })
   },
   handler: async (args) => {
     let message = [...args.message, ...(args["--"] || [])]
@@ -438,6 +443,141 @@ export const RunCommand = cmd({
         return false
       }
 
+      // Trajectory accumulator — populated by the loop below as tool calls
+      // resolve. Mirrors the schema zengram-bench reconstructs from the
+      // JSONL stream today; difference is each record carries the raw
+      // `input` object so downstream analyzers can see fields the bench
+      // parser had to flatten away (read offset/limit, multiedit edits[],
+      // etc.). Written only when --trajectory-json is set.
+      type TrajectoryRecord = {
+        turn: number
+        tool: string
+        input_summary: string
+        status: "completed" | "error"
+        duration_ms: number
+        output_chars: number
+        input: Record<string, unknown>
+      }
+      const trajectoryEnabled = !!args["trajectory-json"]
+      const toolCounts: Record<string, number> = {}
+      const filesTouched = new Map<string, { reads: number; edits: number }>()
+      const bashCommands: string[] = []
+      const records: TrajectoryRecord[] = []
+      let currentTurn = 0
+
+      function fileTouch(p: string) {
+        let entry = filesTouched.get(p)
+        if (!entry) {
+          entry = { reads: 0, edits: 0 }
+          filesTouched.set(p, entry)
+        }
+        return entry
+      }
+
+      function summarizeInput(tool: string, input: Record<string, unknown>): string {
+        const fp = (typeof input.filePath === "string" ? input.filePath : undefined) ??
+          (typeof input.path === "string" ? input.path : undefined)
+        if ((tool === "read" || tool === "edit" || tool === "write") && fp) return `path=${fp}`
+        if (tool === "bash") {
+          const cmd = typeof input.command === "string" ? input.command.slice(0, 80) : ""
+          return `cmd=${cmd}`
+        }
+        if (tool === "grep") {
+          const pat = typeof input.pattern === "string" ? input.pattern : ""
+          const where = typeof input.path === "string" ? input.path :
+            typeof input.include === "string" ? input.include : ""
+          return `pattern=${pat} path=${where}`.trim()
+        }
+        if (tool === "glob") return `pattern=${typeof input.pattern === "string" ? input.pattern : ""}`
+        if (tool === "codesearch")
+          return `q=${typeof input.query === "string" ? input.query : (typeof input.q === "string" ? input.q : "")}`
+        if (tool === "webfetch") return `url=${typeof input.url === "string" ? input.url : ""}`
+        return `keys=${Object.keys(input).filter((k) => !k.startsWith("_")).sort().join(",").slice(0, 80)}`
+      }
+
+      function recordToolCall(part: ToolPart) {
+        if (!trajectoryEnabled) return
+        const tool = part.tool
+        const state = part.state
+        if (state.status !== "completed" && state.status !== "error") return
+        const input = (state.input ?? {}) as Record<string, unknown>
+        const t = (state as unknown as { time?: { start?: number; end?: number } }).time ?? {}
+        // Explicit `typeof === "number"` checks rather than truthiness so a
+        // legitimate 0 timestamp (mocked clock, tool emitting epoch-relative
+        // 0-based timestamps) doesn't get silently treated as "missing" and
+        // collapsed to a 0 duration when it should be undefined-handled.
+        const dur =
+          typeof t.start === "number" && typeof t.end === "number"
+            ? Math.max(0, t.end - t.start)
+            : 0
+        const output = state.status === "completed" ? (state as unknown as { output?: string }).output ?? "" : ""
+        toolCounts[tool] = (toolCounts[tool] ?? 0) + 1
+        records.push({
+          turn: Math.max(currentTurn, 1),
+          tool,
+          input_summary: summarizeInput(tool, input),
+          status: state.status,
+          duration_ms: dur,
+          output_chars: typeof output === "string" ? output.length : 0,
+          input,
+        })
+        const fp = (typeof input.filePath === "string" ? input.filePath : undefined) ??
+          (typeof input.path === "string" ? input.path : undefined)
+        if (tool === "read" && fp) fileTouch(fp).reads++
+        else if ((tool === "edit" || tool === "write") && fp) fileTouch(fp).edits++
+        else if (tool === "apply_patch" && state.status === "completed") {
+          // apply_patch is the codebase's primary patch-based editor (see
+          // ToolRegistry filtering); its completed-state metadata exposes a
+          // `files: [{filePath, type, ...}]` array. Surface those edits in
+          // files_touched so trajectories from apply_patch sessions don't
+          // misleadingly read as "no files touched". `type === "delete"`
+          // still counts as an edit (the file was modified — removed).
+          const meta = (state as unknown as { metadata?: { files?: Array<{ filePath?: string }> } }).metadata
+          for (const f of meta?.files ?? []) {
+            if (typeof f.filePath === "string" && f.filePath) fileTouch(f.filePath).edits++
+          }
+        } else if (tool === "bash" && typeof input.command === "string") {
+          const cmd = input.command.slice(0, 80)
+          if (cmd) bashCommands.push(cmd)
+        }
+      }
+
+      async function writeTrajectoryIfRequested() {
+        const raw = args["trajectory-json"] as string | undefined
+        if (!raw) return
+        // Expand `~/` and `$HOME` so quoted args / Windows shells / contexts
+        // where the shell didn't expand the tilde all work consistently with
+        // the rest of the codebase (config/paths.ts, permission/index.ts,
+        // tool/bash.ts:119, etc.).
+        const out = expandHome(raw)
+        const filesArr = [...filesTouched.entries()]
+          .map(([p, v]) => ({ path: p, ...v }))
+          .sort((a, b) => (b.reads + b.edits) - (a.reads + a.edits))
+        const payload = {
+          tool_counts: toolCounts,
+          files_touched: filesArr,
+          bash_commands: bashCommands,
+          records,
+        }
+        try {
+          // Filesystem.write auto-creates parent directories on ENOENT so
+          // `--trajectory-json some/missing/dir/out.json` works. Centralises
+          // I/O on the codebase's helper rather than reaching for Bun.write
+          // directly.
+          await Filesystem.write(out, JSON.stringify(payload))
+        } catch (e) {
+          // Don't fail the run if trajectory write fails — log and continue.
+          UI.error(`failed to write trajectory: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+
+      function expandHome(p: string): string {
+        if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(homedir(), p.slice(2))
+        if (p === "~") return homedir()
+        if (p.startsWith("$HOME/") || p.startsWith("$HOME\\")) return path.join(homedir(), p.slice(6))
+        return p
+      }
+
       const events = await sdk.event.subscribe()
       let error: string | undefined
 
@@ -462,6 +602,7 @@ export const RunCommand = cmd({
             if (part.sessionID !== sessionID) continue
 
             if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+              recordToolCall(part)
               if (emit("tool_use", { part })) continue
               if (part.state.status === "completed") {
                 tool(part)
@@ -486,6 +627,7 @@ export const RunCommand = cmd({
             }
 
             if (part.type === "step-start") {
+              currentTurn++
               if (emit("step_start", { part })) continue
             }
 
@@ -538,6 +680,7 @@ export const RunCommand = cmd({
             event.properties.sessionID === sessionID &&
             event.properties.status.type === "idle"
           ) {
+            await writeTrajectoryIfRequested()
             break
           }
 
@@ -626,7 +769,14 @@ export const RunCommand = cmd({
       }
       await share(sdk, sessionID)
 
-      loop().catch((e) => {
+      // Capture the loop promise instead of fire-and-forget. The loop awaits
+      // `writeTrajectoryIfRequested()` on session.status idle, but if we
+      // don't await the loop here, execute() returns the moment prompt()
+      // resolves and bootstrap's cleanup tears down the process before the
+      // trajectory write (especially its auto-mkdir branch on a missing
+      // parent dir) finishes its second await. Awaiting the loop ensures
+      // file I/O completes before exit.
+      const loopP = loop().catch((e) => {
         console.error(e)
         process.exit(1)
       })
@@ -650,6 +800,7 @@ export const RunCommand = cmd({
           parts: [...files, { type: "text", text: message }],
         })
       }
+      await loopP
     }
 
     if (args.attach) {
