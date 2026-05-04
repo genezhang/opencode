@@ -26,6 +26,30 @@ export type KnowledgeEntry = {
   content: string
   importance: number
   source_session?: string | null
+  /**
+   * Cosine distance (range [0, 2]) to the recall query's embedding. Populated
+   * only on the vector-path of `recallFacts`; absent on keyword/baseline
+   * paths and on `learnFact` returns. May be null when embed() returned NULL
+   * for the query (e.g. embedding pipeline broken). Lower = more similar.
+   */
+  distance?: number | null
+}
+
+/**
+ * Distance gate for recallFacts (default: off). When ZENGRAM_FACT_MAX_DISTANCE
+ * is set to a positive number, vector-path facts whose embedding distance
+ * to the query exceeds the threshold are dropped — analogous to
+ * ZENGRAM_PLAY_MAX_DISTANCE for plays. Distance is in [0, 2] (cosine).
+ *
+ * Off by default because the right cutoff for facts isn't yet empirically
+ * established and we don't want to silently change behavior. Bench cycles
+ * can probe values via the env var.
+ */
+function factDistanceMax(): number {
+  const raw = process.env["ZENGRAM_FACT_MAX_DISTANCE"]
+  if (!raw) return Number.POSITIVE_INFINITY
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : Number.POSITIVE_INFINITY
 }
 
 /**
@@ -123,22 +147,52 @@ export async function recallFacts(input: {
     // score = 0.7 * (1 - cosine_dist/2) + 0.3 * importance
     // cosine distance is in [0,2] so (1 - dist/2) normalises to [0,1].
     // Rows without embeddings are excluded here; the fallback below covers them.
+    //
+    // Distance is also pulled out as a column so we can gate JS-side. Zeta has
+    // shown edge cases where SQL-level WHERE on `embedding <-> embed(...)`
+    // misbehaves — recallPlays uses the same compute-once-then-filter pattern.
     try {
+      const maxDist = factDistanceMax()
+      // Wrap in a subquery so embed($4) is computed once (as the `distance`
+      // alias) and reused by the ORDER BY scoring expression. The flat form
+      // re-invoked embed($4) inside ORDER BY, doubling the embedding cost
+      // per recall when Zeta doesn't CSE the call. recallPlays uses the same
+      // alias-reuse pattern (ORDER BY distance ASC).
       const vecMatches = await db.query<KnowledgeEntry>(
-        `SELECT id, scope, subject, content, importance, source_session
-         FROM knowledge
-         WHERE project_id = $1
-           AND scope LIKE $2
-           AND status = 'active'
-           AND (valid_to IS NULL OR valid_to > $3)
-           AND embedding IS NOT NULL
-         ORDER BY (0.7 * (1.0 - (embedding <-> embed($4)) / 2.0) + 0.3 * importance) DESC
+        `SELECT id, scope, subject, content, importance, source_session, distance FROM (
+           SELECT id, scope, subject, content, importance, source_session,
+                  (embedding <-> embed($4)) AS distance
+           FROM knowledge
+           WHERE project_id = $1
+             AND scope LIKE $2
+             AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3)
+             AND embedding IS NOT NULL
+         ) sub
+         ORDER BY (0.7 * (1.0 - distance / 2.0) + 0.3 * importance) DESC
          LIMIT ${limit}`,
         [input.projectId, `${scope}%`, now, input.context],
       )
 
-      if (vecMatches.length > 0) return vecMatches
-      // No rows with embeddings → fall through to keyword path
+      // Gate: when ZENGRAM_FACT_MAX_DISTANCE is set, drop facts whose distance
+      // exceeds the threshold. NULL distance means embed() failed for this
+      // query — fail closed (drop) so a broken embedding pipeline doesn't
+      // bypass the gate. Default (env unset) keeps all rows by leaving maxDist
+      // = +Infinity.
+      const gated = Number.isFinite(maxDist)
+        ? vecMatches.filter((r) => r.distance != null && r.distance <= maxDist)
+        : vecMatches
+      if (Number.isFinite(maxDist)) {
+        log.info("recallFacts gated", {
+          total: vecMatches.length,
+          kept: gated.length,
+          maxDist,
+        })
+      }
+
+      if (gated.length > 0) return gated
+      // No rows passed the gate (or no rows had embeddings) → fall through
+      // to keyword path so we still return *something* relevant by token.
     } catch {
       // embed() not available — fall through to keyword path
     }
