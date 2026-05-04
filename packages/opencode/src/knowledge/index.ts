@@ -14,6 +14,12 @@ import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
 import { EXTRACT_FACTS_SYSTEM_PROMPT, REFLECT_SYSTEM_PROMPT } from "./prompts"
+import { looksLikeReasoning } from "./noise"
+
+// Re-export so existing callers / tests can keep importing from
+// "@/knowledge/index" — the predicate lives in its own leaf module so probe
+// scripts can pull it in without triggering the full runtime layer.
+export { looksLikeReasoning } from "./noise"
 
 const log = Log.create({ service: "knowledge" })
 
@@ -334,6 +340,7 @@ const NORMATIVE_RE = /\b(always|never|should(?:n't)?|must(?:n't)?|convention|imp
 // Sentences beginning with an imperative verb (e.g. "Use enums", "Avoid panicking")
 const IMPERATIVE_START_RE = /^(?:\d+\.\s+)?\*{0,2}(Use|Avoid|Prefer|Don't|Never|Always|Make sure|Ensure|Keep|Write|Return|Handle|Check|Wrap|Implement)\b/i
 
+
 /**
  * Heuristic extraction: scan assistant turn text for normative sentences.
  * Returns up to `maxFacts` extracted {subject, content} pairs.
@@ -354,6 +361,8 @@ export function extractFacts(text: string, maxFacts = 3): Array<{ subject: strin
     const clean = sentence.replace(/^\d+\.\s+/, "").replace(/\*\*/g, "").trim()
     const subject = clean.split(/[—\-,:;]/)[0].slice(0, 70).trim()
     if (subject.length < 8) continue
+    // Reject first-person/reasoning openers — see REASONING_NOISE_RE.
+    if (looksLikeReasoning(subject)) continue
     hits.push({ subject, content: clean })
     if (hits.length >= maxFacts) break
   }
@@ -451,10 +460,14 @@ async function extractFactsWithLlm(text: string): Promise<Array<{ subject: strin
     const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
     const parsed = JSON.parse(cleaned)
     if (!Array.isArray(parsed)) return []
-    return parsed.filter(
+    const facts = parsed.filter(
       (f): f is { subject: string; content: string } =>
         typeof f?.subject === "string" && typeof f?.content === "string",
     )
+    // Reject reasoning-style subjects/contents the model may have produced
+    // despite the prompt's REJECT examples. Belt-and-suspenders against the
+    // round2 noise pattern (subjects like "Now I understand the issue").
+    return facts.filter((f) => !looksLikeReasoning(f.subject) && !looksLikeReasoning(f.content))
   } catch (e) {
     log.warn("llm extraction failed", { err: e })
     return []
@@ -514,6 +527,65 @@ export async function decayKnowledge(input: {
   _lastDecayRun.set(input.projectId, now)
   log.info("knowledge decay", { projectId: input.projectId, updated: count })
   return count
+}
+
+/**
+ * Mark reasoning-noise facts as inactive. One-shot maintenance helper — used
+ * to clean a knowledge base populated before the looksLikeReasoning() filter
+ * landed (round2 bench KB exhibited subjects like "Now I understand the
+ * issue", "Let me look at..." that pollute every recall).
+ *
+ * Defaults to `scope='/project'` to match the use case (durable extracted
+ * facts, not plays or other scopes). Pass `scope` to override — e.g.
+ * `scope: undefined` would scan all scopes — but be aware this can demote
+ * unrelated entries. `projectId` further narrows the scan.
+ *
+ * Returns the number of rows demoted to status='inactive'. Idempotent —
+ * subsequent calls demote zero rows. Restores nothing; call only when you
+ * want to permanently retire matching facts.
+ */
+export async function purgeReasoningNoise(input?: {
+  projectId?: ProjectID
+  scope?: string | null
+}): Promise<number> {
+  const db = zengramDb()
+  // Default to /project; pass `scope: null` explicitly to scan every scope
+  // (mostly used by tests). The `??` lets `scope: undefined` from a partial
+  // options object still hit the default.
+  const scope = input?.scope === null ? null : (input?.scope ?? "/project")
+  const conds: string[] = ["status = 'active'"]
+  const params: unknown[] = []
+  if (input?.projectId) {
+    params.push(input.projectId)
+    conds.push(`project_id = $${params.length}`)
+  }
+  if (scope !== null) {
+    params.push(scope)
+    conds.push(`scope = $${params.length}`)
+  }
+  const all = await db.query<{ id: string; subject: string; content: string }>(
+    `SELECT id, subject, content FROM knowledge WHERE ${conds.join(" AND ")}`,
+    params,
+  )
+  const noisy = all.filter((r) => looksLikeReasoning(r.subject) || looksLikeReasoning(r.content))
+  if (noisy.length === 0) {
+    log.info("purgeReasoningNoise", { scanned: all.length, purged: 0 })
+    return 0
+  }
+
+  // Single batched UPDATE — one round-trip instead of N. The IN-list is built
+  // from $2..$N+1 placeholders so each id stays a parameterized bind, never
+  // string-concatenated into the SQL.
+  const now = Date.now() * 1000
+  const ids = noisy.map((r) => r.id)
+  const placeholders = ids.map((_, i) => `$${i + 2}`).join(", ")
+  const purged = await db.execute(
+    `UPDATE knowledge SET status = 'inactive', valid_to = $1, time_updated = $1
+     WHERE status = 'active' AND id IN (${placeholders})`,
+    [now, ...ids],
+  )
+  log.info("purgeReasoningNoise", { scanned: all.length, purged })
+  return purged
 }
 
 /**
