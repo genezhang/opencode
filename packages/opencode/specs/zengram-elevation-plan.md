@@ -7,6 +7,45 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-03 PM (focus_round2 — chunk-aware analyzer)
+
+Re-ran the same 3-task focused suite (dj-12713, dj-14089, dj-15127) × n=5 reps that produced the 2026-04-29 headline, this time with the new instrumentation:
+
+- opencode owns the trajectory parser (#22)
+- zengram-bench adapter is now a passthrough (zengram-bench#8)
+- analyzer dedups read records on `path|offset|limit` instead of just path (zengram-bench#9), so chunked reads of different ranges don't get mislabeled as redundant
+
+**Headline reproduces almost exactly** vs the legacy-parser run from earlier today (focus_round1):
+
+| | focus_round1 (legacy parser) | focus_round2 (chunk-aware) |
+|---|---|---|
+| baseline resolved | 5/15 (33%) | 5/15 (33%) |
+| zengram resolved | 9/15 (60%) | 9/15 (60%) |
+| baseline / 1M tok | 3.24 | 3.88 |
+| zengram / 1M tok | 5.58 | **6.87** |
+| ratio | 1.72× | **1.77×** |
+
+Same per-task pattern: dj-12713 0/0 (zengram 6 turns vs baseline 11.4 — recall halves the work even when neither solves), dj-14089 5/5 both (gate correctly drops cross-task plays on the easy task), dj-15127 0 baseline / 4 zengram (the smoking-gun task).
+
+### The redundant_read finding (this is the headline of the round)
+
+The chunk-aware analyzer reveals that **nearly all of what previously looked like "redundant reads" were chunked reads of different file ranges**, not literal re-reads:
+
+| | redundant_read % (legacy parser) | redundant_read % (chunk-aware) |
+|---|---|---|
+| baseline | 8.8% | **0.0%** (0 of 164 calls) |
+| zengram | 12.7% | **2.8%** (3 of 107 calls) |
+
+The 8.8–20% redundant_read counts in the survey25 narrative were almost entirely **false positives** caused by the bench parser flattening read inputs to just the file path. The model's actual literal re-read rate on this corpus is ~0–3%.
+
+This reframes the next investigation: `redundant_read` isn't where the optimization win lives. The real signal is in `no_edit` sessions (mid-task abandonment when the model gives up empty-handed) and per-task token-efficiency asymmetry — the dj-15127-style win and the survey25 dj-16595-style blowup.
+
+### Methodology note: 5 reps per task is artificial
+
+The n=5 design carried over from the 2026-04-29 reference run was lazy reproduction. Re-running the *same* task 5 times tests the wrong thing — real-world recall benefit comes from plays compounding across *different* tasks in the same domain, not across reps of one task. The proper validation is N=1 across a larger task pool (the survey25 shape), and that's the next bench cycle.
+
+---
+
 ## Status snapshot — 2026-05-03 (first end-to-end with the trajectory analyzer live)
 
 First survey since the trajectory minimizer + analyzer (zengram-bench PR #3) and the play recall pipeline (PR #19) landed. 25-task Django subset × n=1 × 2 variants = 50 invocations, multi-session BENCH_SUITE_NAME=survey25_round1 so plays compound across the suite.
