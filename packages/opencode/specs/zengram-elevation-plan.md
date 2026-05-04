@@ -7,6 +7,80 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-04 (survey25_round2 — chunk-aware end-to-end + path-dependence finding)
+
+Re-ran the same 25-task subset × n=1 × 2 variants that produced the 2026-05-03 AM survey25 numbers, this time with the chunk-aware analyzer (zengram-bench#9) live end-to-end. Clean slate — wiped multi-session-state, archived prior results, `BENCH_SUITE_NAME=survey25_round2`.
+
+### Headline reproduces and improves slightly
+
+| | survey25_round1 (legacy parser) | **survey25_round2 (chunk-aware)** |
+|---|---|---|
+| baseline resolved | 1/25 (4%) | 1/25 (4%) |
+| zengram resolved | 3/25 (12%) | 3/25 (12%) |
+| baseline / 1M tok | 0.44 | 0.39 |
+| zengram / 1M tok | 1.06 | **1.10** |
+| **ratio** | 2.41× | **2.83×** |
+
+### redundant_read confirmed as noise at scale
+
+Same finding as focus_round2 but on the full 25-task pool:
+
+| | round1 (legacy) | round2 (chunk-aware) |
+|---|---|---|
+| baseline redundant_read % | 20.3% | **1.9%** (6 of 321) |
+| zengram redundant_read % | 17.2% | **1.0%** (3 of 313) |
+| useful % | 79.3 / 82.8 | **98.1 / 99.0** |
+
+The model is doing legitimate work on essentially every tool call. The "lots of redundant reads" framing in the original survey25 narrative was an artifact of the bench parser flattening read inputs to just the file path.
+
+### The new finding: path-dependence
+
+Same task pool, two rounds, dramatically different per-task outcomes — the asymmetric-burn pattern isn't fixed-per-task. Specific reversals:
+
+| task | round1 Δ% (zengram vs baseline tok) | round2 Δ% | flipped? |
+|---|---|---|---|
+| **dj-16595** | **+250%** (the canonical blowup of round1) | **-43%** (now a clean win) | ✓ |
+| **dj-13297** | +380% | -52% | ✓ |
+| dj-10097 | parity | -91% (12k vs 137k, 2 turns vs 15 — early-quit firing) | ✓ |
+| dj-14787 | -58% | -17% | regressed but still a win |
+| **dj-15814** | parity-ish | **+129%** | now a blowup |
+| **dj-11999** | parity | **+87%** | now a blowup |
+| dj-15561 | small | +77% | blowup, was already trending |
+
+Same recall pipeline, same task pool, very different per-task asymmetries. The natural first guess was *plays state at task-N* — but the post-run DB inspection (next section) rules that out.
+
+### Post-run inspection — *plays were empty for every task in this suite*
+
+Dumping zengram state at end of round2 reveals the win mechanism is **not plays**:
+
+| state | count | gating | per-session injection |
+|---|---|---|---|
+| `/play` | **10 plays** | `ZENGRAM_PLAY_MAX_DISTANCE=0.5` | **0 of 10 pass for every queried task — empty plays-block all round** |
+| `/project` (facts) | **68 facts** | none — top 20 by `0.7×similarity + 0.3×importance` | **20 facts injected every session** |
+| `workspace_file` | 66 rows / 25 sessions | per-session | session-local |
+
+Every cross-task play sits at distance 0.69–0.85 in the embedding model. The 0.5 gate rejects every one. The "compounding recall" thesis from the 2026-04-29 snapshot is genuine for **task repetition** (n=5 focused suite — same-task plays at d≈0.1 do compound and drive the win). It does **not** apply to **cross-task N=1 surveys**: by construction, no same-task play exists when each task runs once, and cross-task plays don't pass the gate.
+
+So the 2.83× resolved/Mtok ratio in survey25_round2 is **driven by facts, not plays**. The 68 facts that accumulated across sessions get injected 20 at a time at every session start, with no distance gating — a substantial body of cross-session signal, but also unfiltered noise.
+
+A spot-check of fact subjects shows another concern: most start with `"Now I can see the issue..."` or `"Let me look at..."` — they're raw LLM reasoning captured by the reflection step rather than extracted normative claims. The reflection prompt may be misfiring.
+
+### What this implies for the next lever
+
+The earlier framing of this snapshot (per-task play limit, play eviction, stricter play gate) was based on the wrong mechanism. The plays pipeline isn't the bottleneck in cross-task surveys because it isn't *engaging* in cross-task surveys. The actual levers worth investigating:
+
+1. **Add distance gating to `recallFacts`** — currently ungated, top 20 by score. Apply the same idea as `ZENGRAM_PLAY_MAX_DISTANCE` so noise facts (low semantic relevance) don't surface.
+2. **Audit fact extraction quality** — fact subjects look like raw reflection output, not normative claims. Tighten the EXTRACT_FACTS_SYSTEM_PROMPT so subjects are useful retrieval keys.
+3. **Cap injected fact count by relevance** — even with gating, 20 facts × ~150 chars each is a meaningful prompt slice; lower the limit and see if fewer-but-better facts perform better.
+
+Investigation order: ship gating + measure first (similar shape to plays' ZENGRAM_PLAY_MAX_DISTANCE), then if numbers move, look at extraction prompt next. The path-dependence finding above is consistent with this — different facts accumulate in different suite orders, and an ungated top-20 amplifies the variance.
+
+### Methodology held over from focus_round2
+
+n=1 × 25 tasks is the right shape *for measuring cross-task transfer* (which is what facts deliver). For repetition-driven plays compounding, n>1 on a smaller pool is the right shape. **The two scenarios test different mechanisms and the elevation plan should treat them separately going forward** rather than blending plays and facts under "compounding recall." 1 vs 3 resolved at N=1 is small-sample sensitive — ratio and per-task pattern are the load-bearing signals.
+
+---
+
 ## Status snapshot — 2026-05-03 PM (focus_round2 — chunk-aware analyzer)
 
 Re-ran the same 3-task focused suite (dj-12713, dj-14089, dj-15127) × n=5 reps that produced the 2026-04-29 headline, this time with the new instrumentation:
