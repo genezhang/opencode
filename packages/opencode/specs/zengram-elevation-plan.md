@@ -7,6 +7,64 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-04 (survey25_round2 — chunk-aware end-to-end + path-dependence finding)
+
+Re-ran the same 25-task subset × n=1 × 2 variants that produced the 2026-05-03 AM survey25 numbers, this time with the chunk-aware analyzer (zengram-bench#9) live end-to-end. Clean slate — wiped multi-session-state, archived prior results, `BENCH_SUITE_NAME=survey25_round2`.
+
+### Headline reproduces and improves slightly
+
+| | survey25_round1 (legacy parser) | **survey25_round2 (chunk-aware)** |
+|---|---|---|
+| baseline resolved | 1/25 (4%) | 1/25 (4%) |
+| zengram resolved | 3/25 (12%) | 3/25 (12%) |
+| baseline / 1M tok | 0.44 | 0.39 |
+| zengram / 1M tok | 1.06 | **1.10** |
+| **ratio** | 2.41× | **2.83×** |
+
+### redundant_read confirmed as noise at scale
+
+Same finding as focus_round2 but on the full 25-task pool:
+
+| | round1 (legacy) | round2 (chunk-aware) |
+|---|---|---|
+| baseline redundant_read % | 20.3% | **1.9%** (6 of 321) |
+| zengram redundant_read % | 17.2% | **1.0%** (3 of 313) |
+| useful % | 79.3 / 82.8 | **98.1 / 99.0** |
+
+The model is doing legitimate work on essentially every tool call. The "lots of redundant reads" framing in the original survey25 narrative was an artifact of the bench parser flattening read inputs to just the file path.
+
+### The new finding: path-dependence
+
+Same task pool, two rounds, dramatically different per-task outcomes — the asymmetric-burn pattern isn't fixed-per-task. Specific reversals:
+
+| task | round1 Δ% (zengram vs baseline tok) | round2 Δ% | flipped? |
+|---|---|---|---|
+| **dj-16595** | **+250%** (the canonical blowup of round1) | **-43%** (now a clean win) | ✓ |
+| **dj-13297** | +380% | -52% | ✓ |
+| dj-10097 | parity | -91% (12k vs 137k, 2 turns vs 15 — early-quit firing) | ✓ |
+| dj-14787 | -58% | -17% | regressed but still a win |
+| **dj-15814** | parity-ish | **+129%** | now a blowup |
+| **dj-11999** | parity | **+87%** | now a blowup |
+| dj-15561 | small | +77% | blowup, was already trending |
+
+Same recall pipeline, same task pool, very different per-task asymmetries. Read: **the order tasks were encountered, and the plays accumulated by the time task N runs, materially affects which plays surface for any given task.** It's not "task X always blows up because plays from Y mislead it" — it's "in this particular suite traversal, X was the unlucky recipient of unhelpful nearby plays."
+
+### What this implies for the next lever
+
+The "tighten the similarity gate" lever from the 2026-05-03 AM snapshot was already defunct after focus_round2 (redundant_read was noise). With path-dependence on top, **gate tightening alone cannot fix asymmetric burn** — even on a clean suite, plays state at task-N drives the outcome. The real levers worth investigating, in rough order of expected leverage:
+
+1. **Per-task play limit at recall time** — cap N plays in the plays-block regardless of suite progress, so block size doesn't grow with suite traversal. Already half-implemented via `recallPlays.limit` (default 3); needs experiments at varying caps and a study of what's actually in the block on blowup tasks.
+2. **Play eviction / aging** — limit how many plays accumulate in the DB before older ones drop out, so a 25-task suite doesn't carry 25+ plays into the recall pool by task 25. Distinct from (1): one bounds the *output*, this bounds the *pool*.
+3. **Stricter relevance threshold** combined with one of the above. Distance gating alone underperforms when the candidate pool itself is the problem; combined, it might.
+
+Investigation order: dump plays-state at end of round2 first, see what's actually in the DB and what plays each blowup task's recall fetched. Pre-experiment evidence-gathering before any code change — we don't yet know which lever moves the path-dependence asymmetry, and "experiment without measurement" is what got us into the redundant_read red herring in the first place.
+
+### Methodology held over from focus_round2
+
+n=1 × 25 tasks is the right shape (compounding-recall benefit comes from plays across *different* tasks in the same domain, not across reps of one task). 1 vs 3 resolved at this scale is small-sample sensitive — the *ratio* (2.83×) and per-task pattern are still the load-bearing signals.
+
+---
+
 ## Status snapshot — 2026-05-03 PM (focus_round2 — chunk-aware analyzer)
 
 Re-ran the same 3-task focused suite (dj-12713, dj-14089, dj-15127) × n=5 reps that produced the 2026-04-29 headline, this time with the new instrumentation:
