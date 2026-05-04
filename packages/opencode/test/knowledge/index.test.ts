@@ -17,6 +17,7 @@ import {
   formatKnowledgeBlock,
   formatPlaysBlock,
   formatWorkspaceBlock,
+  recallFacts,
   recallPlays,
   recallWorkspaceContext,
   recordPlay,
@@ -555,6 +556,73 @@ describe("buildEditChanges JOIN aliasing (PR #19 review #7)", () => {
     const partToolSql = seenSql.find((s) => s.includes("FROM part") && s.includes("type = 'tool'"))
     expect(partToolSql).toBeDefined()
     expect(partToolSql!).toContain("AS data")
+  })
+})
+
+describe("recallFacts ZENGRAM_FACT_MAX_DISTANCE gate", () => {
+  const NEAR = { id: "knw_near", scope: "/project", subject: "near", content: "...", importance: 0.8, source_session: null, distance: 0.2 }
+  const FAR  = { id: "knw_far",  scope: "/project", subject: "far",  content: "...", importance: 0.8, source_session: null, distance: 0.9 }
+  const NULLD = { id: "knw_null", scope: "/project", subject: "broken-embed", content: "...", importance: 0.8, source_session: null, distance: null }
+
+  test("default (env unset) keeps all rows — no behavior change vs prior", async () => {
+    delete process.env["ZENGRAM_FACT_MAX_DISTANCE"]
+    queryRows = [NEAR, FAR, NULLD]
+    const out = await recallFacts({
+      projectId: "proj_test" as any,
+      context: "some user message text long enough to embed",
+    })
+    expect(out.map((r) => r.id)).toEqual(["knw_near", "knw_far", "knw_null"])
+  })
+
+  test("env set to 0.5 drops far + null", async () => {
+    process.env["ZENGRAM_FACT_MAX_DISTANCE"] = "0.5"
+    queryRows = [NEAR, FAR, NULLD]
+    const out = await recallFacts({
+      projectId: "proj_test" as any,
+      context: "some user message text long enough to embed",
+    })
+    const ids = out.map((r) => r.id)
+    expect(ids).toContain("knw_near")
+    expect(ids).not.toContain("knw_far")  // 0.9 > 0.5
+    expect(ids).not.toContain("knw_null") // fail-closed on null distance
+    delete process.env["ZENGRAM_FACT_MAX_DISTANCE"]
+  })
+
+  test("env set to non-numeric falls back to no-gate", async () => {
+    process.env["ZENGRAM_FACT_MAX_DISTANCE"] = "abc"
+    queryRows = [NEAR, FAR]
+    const out = await recallFacts({
+      projectId: "proj_test" as any,
+      context: "some user message text long enough to embed",
+    })
+    expect(out.length).toBe(2) // both kept
+    delete process.env["ZENGRAM_FACT_MAX_DISTANCE"]
+  })
+
+  test("when all rows fail the gate, falls through to keyword path", async () => {
+    process.env["ZENGRAM_FACT_MAX_DISTANCE"] = "0.1"
+    // First call returns vector matches that all fail the gate; subsequent
+    // calls return empty (keyword path) — verify recallFacts doesn't return
+    // an empty array silently when gating could fall through to keywords.
+    let call = 0
+    const dispatchClient = {
+      query: async (_sql: string, _params?: unknown[]) => {
+        call++
+        if (call === 1) return [FAR] as any  // 0.9 > 0.1 → gated out
+        return [] as any                      // keyword path returns empty
+      },
+      execute: async () => 0,
+    }
+    zengramModule.setZengramClient(dispatchClient as never)
+    const out = await recallFacts({
+      projectId: "proj_test" as any,
+      context: "some unique tokens xyzwq vwxyz that match no row",
+    })
+    // Vector path returned 0 after gating → fallback path queried → 0 results.
+    // The point is the fallback path was *attempted* (call > 1).
+    expect(call).toBeGreaterThan(1)
+    expect(out).toEqual([])
+    delete process.env["ZENGRAM_FACT_MAX_DISTANCE"]
   })
 })
 
