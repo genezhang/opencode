@@ -47,21 +47,37 @@ Same task pool, two rounds, dramatically different per-task outcomes — the asy
 | **dj-11999** | parity | **+87%** | now a blowup |
 | dj-15561 | small | +77% | blowup, was already trending |
 
-Same recall pipeline, same task pool, very different per-task asymmetries. Read: **the order tasks were encountered, and the plays accumulated by the time task N runs, materially affects which plays surface for any given task.** It's not "task X always blows up because plays from Y mislead it" — it's "in this particular suite traversal, X was the unlucky recipient of unhelpful nearby plays."
+Same recall pipeline, same task pool, very different per-task asymmetries. The natural first guess was *plays state at task-N* — but the post-run DB inspection (next section) rules that out.
+
+### Post-run inspection — *plays were empty for every task in this suite*
+
+Dumping zengram state at end of round2 reveals the win mechanism is **not plays**:
+
+| state | count | gating | per-session injection |
+|---|---|---|---|
+| `/play` | **10 plays** | `ZENGRAM_PLAY_MAX_DISTANCE=0.5` | **0 of 10 pass for every queried task — empty plays-block all round** |
+| `/project` (facts) | **68 facts** | none — top 20 by `0.7×similarity + 0.3×importance` | **20 facts injected every session** |
+| `workspace_file` | 66 rows / 25 sessions | per-session | session-local |
+
+Every cross-task play sits at distance 0.69–0.85 in the embedding model. The 0.5 gate rejects every one. The "compounding recall" thesis from the 2026-04-29 snapshot is genuine for **task repetition** (n=5 focused suite — same-task plays at d≈0.1 do compound and drive the win). It does **not** apply to **cross-task N=1 surveys**: by construction, no same-task play exists when each task runs once, and cross-task plays don't pass the gate.
+
+So the 2.83× resolved/Mtok ratio in survey25_round2 is **driven by facts, not plays**. The 68 facts that accumulated across sessions get injected 20 at a time at every session start, with no distance gating — a substantial body of cross-session signal, but also unfiltered noise.
+
+A spot-check of fact subjects shows another concern: most start with `"Now I can see the issue..."` or `"Let me look at..."` — they're raw LLM reasoning captured by the reflection step rather than extracted normative claims. The reflection prompt may be misfiring.
 
 ### What this implies for the next lever
 
-The "tighten the similarity gate" lever from the 2026-05-03 AM snapshot was already defunct after focus_round2 (redundant_read was noise). With path-dependence on top, **gate tightening alone cannot fix asymmetric burn** — even on a clean suite, plays state at task-N drives the outcome. The real levers worth investigating, in rough order of expected leverage:
+The earlier framing of this snapshot (per-task play limit, play eviction, stricter play gate) was based on the wrong mechanism. The plays pipeline isn't the bottleneck in cross-task surveys because it isn't *engaging* in cross-task surveys. The actual levers worth investigating:
 
-1. **Per-task play limit at recall time** — cap N plays in the plays-block regardless of suite progress, so block size doesn't grow with suite traversal. Already half-implemented via `recallPlays.limit` (default 3); needs experiments at varying caps and a study of what's actually in the block on blowup tasks.
-2. **Play eviction / aging** — limit how many plays accumulate in the DB before older ones drop out, so a 25-task suite doesn't carry 25+ plays into the recall pool by task 25. Distinct from (1): one bounds the *output*, this bounds the *pool*.
-3. **Stricter relevance threshold** combined with one of the above. Distance gating alone underperforms when the candidate pool itself is the problem; combined, it might.
+1. **Add distance gating to `recallFacts`** — currently ungated, top 20 by score. Apply the same idea as `ZENGRAM_PLAY_MAX_DISTANCE` so noise facts (low semantic relevance) don't surface.
+2. **Audit fact extraction quality** — fact subjects look like raw reflection output, not normative claims. Tighten the EXTRACT_FACTS_SYSTEM_PROMPT so subjects are useful retrieval keys.
+3. **Cap injected fact count by relevance** — even with gating, 20 facts × ~150 chars each is a meaningful prompt slice; lower the limit and see if fewer-but-better facts perform better.
 
-Investigation order: dump plays-state at end of round2 first, see what's actually in the DB and what plays each blowup task's recall fetched. Pre-experiment evidence-gathering before any code change — we don't yet know which lever moves the path-dependence asymmetry, and "experiment without measurement" is what got us into the redundant_read red herring in the first place.
+Investigation order: ship gating + measure first (similar shape to plays' ZENGRAM_PLAY_MAX_DISTANCE), then if numbers move, look at extraction prompt next. The path-dependence finding above is consistent with this — different facts accumulate in different suite orders, and an ungated top-20 amplifies the variance.
 
 ### Methodology held over from focus_round2
 
-n=1 × 25 tasks is the right shape (compounding-recall benefit comes from plays across *different* tasks in the same domain, not across reps of one task). 1 vs 3 resolved at this scale is small-sample sensitive — the *ratio* (2.83×) and per-task pattern are still the load-bearing signals.
+n=1 × 25 tasks is the right shape *for measuring cross-task transfer* (which is what facts deliver). For repetition-driven plays compounding, n>1 on a smaller pool is the right shape. **The two scenarios test different mechanisms and the elevation plan should treat them separately going forward** rather than blending plays and facts under "compounding recall." 1 vs 3 resolved at N=1 is small-sample sensitive — ratio and per-task pattern are the load-bearing signals.
 
 ---
 
