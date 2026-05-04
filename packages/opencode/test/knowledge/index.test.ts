@@ -130,6 +130,27 @@ describe("extractFacts", () => {
       expect(facts[0].subject.length).toBeLessThanOrEqual(70)
     }
   })
+
+  test("rejects first-person reasoning openers (round2 noise)", () => {
+    // These look like normative-ish sentences but are just the assistant
+    // narrating its own thinking — shouldn't become facts.
+    const cases = [
+      "Now I understand the issue. Looking at the test file, we should always use parameterized queries.",
+      "Let me look at the issue more carefully. The problem is in `_save_table` and we must avoid that pattern.",
+      "Now I'll fix the issue by changing line 673 to use duck typing always.",
+      "Perfect! Now I understand the structure — never escape twice in this template.",
+    ]
+    for (const text of cases) {
+      const facts = extractFacts(text)
+      // Even if the sentence contains a normative keyword (always, must, never),
+      // the leading reasoning opener should disqualify it.
+      for (const f of facts) {
+        expect(f.subject.toLowerCase()).not.toMatch(
+          /^(now i|let me|let's|now i'll|perfect[!.]|looking at|i see)/,
+        )
+      }
+    }
+  })
 })
 
 // ── formatKnowledgeBlock ──────────────────────────────────────────────────────
