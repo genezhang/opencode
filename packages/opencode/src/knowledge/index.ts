@@ -27,11 +27,12 @@ export type KnowledgeEntry = {
   importance: number
   source_session?: string | null
   /**
-   * L2 distance to the recall query's embedding. Populated only on the
-   * vector-path of `recallFacts`; absent on keyword/baseline paths and on
-   * `learnFact` returns. Lower = more similar.
+   * Cosine distance (range [0, 2]) to the recall query's embedding. Populated
+   * only on the vector-path of `recallFacts`; absent on keyword/baseline
+   * paths and on `learnFact` returns. May be null when embed() returned NULL
+   * for the query (e.g. embedding pipeline broken). Lower = more similar.
    */
-  distance?: number
+  distance?: number | null
 }
 
 /**
@@ -152,16 +153,23 @@ export async function recallFacts(input: {
     // misbehaves — recallPlays uses the same compute-once-then-filter pattern.
     try {
       const maxDist = factDistanceMax()
+      // Wrap in a subquery so embed($4) is computed once (as the `distance`
+      // alias) and reused by the ORDER BY scoring expression. The flat form
+      // re-invoked embed($4) inside ORDER BY, doubling the embedding cost
+      // per recall when Zeta doesn't CSE the call. recallPlays uses the same
+      // alias-reuse pattern (ORDER BY distance ASC).
       const vecMatches = await db.query<KnowledgeEntry>(
-        `SELECT id, scope, subject, content, importance, source_session,
-                (embedding <-> embed($4)) AS distance
-         FROM knowledge
-         WHERE project_id = $1
-           AND scope LIKE $2
-           AND status = 'active'
-           AND (valid_to IS NULL OR valid_to > $3)
-           AND embedding IS NOT NULL
-         ORDER BY (0.7 * (1.0 - (embedding <-> embed($4)) / 2.0) + 0.3 * importance) DESC
+        `SELECT id, scope, subject, content, importance, source_session, distance FROM (
+           SELECT id, scope, subject, content, importance, source_session,
+                  (embedding <-> embed($4)) AS distance
+           FROM knowledge
+           WHERE project_id = $1
+             AND scope LIKE $2
+             AND status = 'active'
+             AND (valid_to IS NULL OR valid_to > $3)
+             AND embedding IS NOT NULL
+         ) sub
+         ORDER BY (0.7 * (1.0 - distance / 2.0) + 0.3 * importance) DESC
          LIMIT ${limit}`,
         [input.projectId, `${scope}%`, now, input.context],
       )
