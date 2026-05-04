@@ -20,6 +20,11 @@ async function main(): Promise<void> {
   const { zengramDb } = await import("../src/storage/db.zengram")
   const { runEmbeddedMigrations } = await import("../src/storage/zengram-migrate")
   const { Global } = await import("../src/global")
+  // Import the same predicate the runtime uses — duplicating the regex in
+  // this script would let dry-run output drift from purgeReasoningNoise()'s
+  // actual behavior. Importing from the leaf `noise` module avoids pulling
+  // the full agent runtime (Provider, etc.) into this one-shot script.
+  const { looksLikeReasoning } = await import("../src/knowledge/noise")
 
   const dataDir = path.join(Global.Path.data, "zeta")
   if (!fs.existsSync(dataDir)) {
@@ -30,16 +35,16 @@ async function main(): Promise<void> {
   runEmbeddedMigrations(rawEmbeddedDb())
   const db = zengramDb()
 
-  // Mirror REASONING_NOISE_RE from src/knowledge/index.ts. Keep in sync —
-  // small enough that duplicating beats wiring an export through.
-  const noise = /^(?:\*{0,2})(now\s+(?:i|let)|let\s+me|let's|i(?:'ll|'m| (?:see|can|need|will|understand|think|believe|notice|realize))|looking at|i see|perfect[!.]|great[!.]|the (?:problem|issue|bug|fix) (?:is|seems|appears|looks|here|now)|so |actually,|wait,|hmm,|first,|then,|next,|after that)/i
-
   const rows = await db.query<{ id: string; subject: string; content: string; scope: string }>(
     `SELECT id, subject, content, scope FROM knowledge
      WHERE status = 'active' AND scope = '/project'
      ORDER BY scope ASC`,
   )
-  const noisy = rows.filter((r) => noise.test(r.subject.trim()) || noise.test(r.content.trim()))
+  if (rows.length === 0) {
+    console.error("ERROR: zero active /project facts in DB — wrong pinned dir?")
+    process.exit(1)
+  }
+  const noisy = rows.filter((r) => looksLikeReasoning(r.subject) || looksLikeReasoning(r.content))
 
   console.log(`Total active /project facts: ${rows.length}`)
   console.log(`Would purge:                 ${noisy.length}`)

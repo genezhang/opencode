@@ -89,7 +89,14 @@ async function main(): Promise<void> {
      WHERE project_id = $1 AND scope = '/project' AND status = 'active' AND embedding IS NOT NULL`,
     [projectId],
   )
-  console.error(`[probe] project_id=${projectId} active /project facts with embedding: ${totalFacts[0].n}`)
+  const factCount = totalFacts[0]?.n ?? 0
+  console.error(`[probe] project_id=${projectId} active /project facts with embedding: ${factCount}`)
+  if (!factCount) {
+    console.error(
+      "ERROR: zero active /project facts with embeddings — wrong dir, or embeddings not yet backfilled?",
+    )
+    process.exit(1)
+  }
 
   const allDistances: number[] = []
   const perTask: Array<{
@@ -131,10 +138,16 @@ async function main(): Promise<void> {
     buckets[b]++
   }
   const total = allDistances.length
+  if (total === 0) {
+    console.error(
+      "ERROR: no finite distances returned — embed() may not be loaded; cannot compute histogram.",
+    )
+    process.exit(1)
+  }
 
   console.log("")
   console.log("=== Distance histogram across all (task × fact) pairs ===")
-  console.log(`Total pairs: ${total}  (= ${tasksRaw.length} tasks × ${totalFacts[0].n} facts)`)
+  console.log(`Total pairs: ${total}  (= ${tasksRaw.length} tasks × ${factCount} facts)`)
   console.log("")
   console.log("range          count   pct   cumulative")
   let cum = 0
