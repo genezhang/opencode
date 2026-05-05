@@ -75,7 +75,10 @@ export function factInjectLimit(): number {
   if (!raw) return 20
   const n = Number(raw)
   if (!Number.isFinite(n) || n <= 0) return 20
-  return Math.min(Math.floor(n), 100)
+  // Clamp to [1, 100]: floor() of values in (0,1) collapses to 0, which would
+  // produce LIMIT 0 and silently inject no facts — not what someone setting
+  // a positive number expects. Floor for everything ≥ 1, but never below 1.
+  return Math.max(1, Math.min(Math.floor(n), 100))
 }
 
 /**

@@ -684,6 +684,16 @@ describe("factInjectLimit env helper", () => {
     process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "5.7"
     expect(factInjectLimit()).toBe(5)
   })
+
+  test("clamps to 1 for fractional values in (0, 1) — floor would otherwise yield 0", () => {
+    // Raised by Copilot review on PR #28: floor(0.7) = 0, which would silently
+    // inject zero facts. Positive-but-tiny values should clamp to the minimum
+    // useful injection (1).
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "0.7"
+    expect(factInjectLimit()).toBe(1)
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "0.01"
+    expect(factInjectLimit()).toBe(1)
+  })
 })
 
 describe("recallPlays NULL-distance fail-closed (PR #19 review #3)", () => {
