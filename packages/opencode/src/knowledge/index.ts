@@ -59,6 +59,29 @@ function factDistanceMax(): number {
 }
 
 /**
+ * Default injection limit for recallFacts callers (currently the session
+ * preamble in session/prompt.ts). Set ZENGRAM_FACT_INJECT_LIMIT to lower the
+ * top-K cap below 20 — bench round4 tests whether top-5 (fewer-but-stronger
+ * facts) outperforms top-20 (more context, more noise). Round3 cleaned the
+ * fact pool but didn't move the headline; this lever tests whether the
+ * remaining signal is being diluted by tail facts that scrape the score
+ * threshold without actually helping.
+ *
+ * Default 20 preserves behavior when env unset. Capped at 100 (same as
+ * recallFacts' internal limit cap).
+ */
+export function factInjectLimit(): number {
+  const raw = process.env["ZENGRAM_FACT_INJECT_LIMIT"]
+  if (!raw) return 20
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return 20
+  // Clamp to [1, 100]: floor() of values in (0,1) collapses to 0, which would
+  // produce LIMIT 0 and silently inject no facts — not what someone setting
+  // a positive number expects. Floor for everything ≥ 1, but never below 1.
+  return Math.max(1, Math.min(Math.floor(n), 100))
+}
+
+/**
  * Store a fact in the knowledge table.
  * Skips duplicate subjects within the same scope (simple exact match).
  */

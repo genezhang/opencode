@@ -44,6 +44,7 @@ import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import {
   recallFacts,
+  factInjectLimit,
   formatKnowledgeBlock,
   recallWorkspaceContext,
   formatWorkspaceBlock,
@@ -1516,7 +1517,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
                   Effect.promise(() =>
-                    recallFacts({ projectId: Instance.project.id, limit: 20, context: userText || undefined }),
+                    recallFacts({
+                      projectId: Instance.project.id,
+                      limit: factInjectLimit(),
+                      context: userText || undefined,
+                    }),
                   ),
                   Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID })),
                   // Plays: files that solved semantically-similar past problems.

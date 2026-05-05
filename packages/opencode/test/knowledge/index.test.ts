@@ -14,6 +14,7 @@ import type { WorkspaceFileEntry, KnowledgeEntry } from "../../src/knowledge/ind
 import {
   extractAndLearn,
   extractFacts,
+  factInjectLimit,
   formatKnowledgeBlock,
   formatPlaysBlock,
   formatWorkspaceBlock,
@@ -644,6 +645,54 @@ describe("recallFacts ZENGRAM_FACT_MAX_DISTANCE gate", () => {
     expect(call).toBeGreaterThan(1)
     expect(out).toEqual([])
     delete process.env["ZENGRAM_FACT_MAX_DISTANCE"]
+  })
+})
+
+describe("factInjectLimit env helper", () => {
+  afterEach(() => {
+    delete process.env["ZENGRAM_FACT_INJECT_LIMIT"]
+  })
+
+  test("default (env unset) returns 20", () => {
+    delete process.env["ZENGRAM_FACT_INJECT_LIMIT"]
+    expect(factInjectLimit()).toBe(20)
+  })
+
+  test("env set to 5 returns 5", () => {
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "5"
+    expect(factInjectLimit()).toBe(5)
+  })
+
+  test("env set to non-numeric falls back to 20", () => {
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "abc"
+    expect(factInjectLimit()).toBe(20)
+  })
+
+  test("env set to 0 or negative falls back to 20", () => {
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "0"
+    expect(factInjectLimit()).toBe(20)
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "-3"
+    expect(factInjectLimit()).toBe(20)
+  })
+
+  test("caps at 100", () => {
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "500"
+    expect(factInjectLimit()).toBe(100)
+  })
+
+  test("floors fractional values", () => {
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "5.7"
+    expect(factInjectLimit()).toBe(5)
+  })
+
+  test("clamps to 1 for fractional values in (0, 1) — floor would otherwise yield 0", () => {
+    // Raised by Copilot review on PR #28: floor(0.7) = 0, which would silently
+    // inject zero facts. Positive-but-tiny values should clamp to the minimum
+    // useful injection (1).
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "0.7"
+    expect(factInjectLimit()).toBe(1)
+    process.env["ZENGRAM_FACT_INJECT_LIMIT"] = "0.01"
+    expect(factInjectLimit()).toBe(1)
   })
 })
 
