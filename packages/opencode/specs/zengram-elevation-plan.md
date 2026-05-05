@@ -7,6 +7,135 @@ elevation or rule something out.
 
 ---
 
+## ⚠️ Status snapshot — 2026-05-05 late (CORRECTION: scorer caching artifact invalidates round1–5 narrative)
+
+Investigation triggered by the user pointing out that the "Qwen3-Coder-30B-A3B vs Next" model-swap explanation for the resolution regression couldn't be right (both rounds were on Next). Root-causing the actual regression turned up a much bigger problem.
+
+### Root cause: scorer was skip-if-exists, score files shared across rounds
+
+`zengram-bench/harness/scorer/score.py` skipped any run with an existing score JSON. All five rounds wrote into the same `results/scores/` and used identical task-id keys (`django__django-11099_baseline_0.json`, etc.), so round 2–5 invocations of `score.py` only actually scored runs without a pre-existing score file. **For every task that round 1 scored, rounds 2–5 silently kept round 1's score even when the round-N patch differed.**
+
+Confirmed by isolation: re-scoring each round's archive into its own scores dir gives radically different totals.
+
+### Corrected 5-round headline
+
+| round | BL res | ZG res | tok ratio | res/Mtok ratio | (originally reported) |
+|---|---|---|---|---|---|
+| 1 | 3 | 2 | 1.38× | **0.48×** *(zengram lost!)* | 2.41× |
+| 2 | 2 | 4 | 1.06× | 1.89× | 2.83× |
+| 3 | 2 | 3 | 1.22× | 1.23× | 2.53× |
+| 4 | 3 | 4 | 0.96× | 1.39× | 3.12× |
+| 5 | 2 | 5 | 1.17× | 2.14× | 2.55× |
+| **mean** | **2.4 ± 0.5** | **3.6 ± 1.1** | **1.16×** | **1.43× ± 0.64** | 2.69× ± 0.28 |
+
+### What this changes about the prior narrative
+
+1. **Resolution count is NOT pinned at 1/3.** It varies 2–3 baseline, 2–5 zengram. The "ceiling" framing was an artifact.
+2. **Round 1 zengram actually *lost* to baseline** (2 vs 3 resolved, 0.48× ratio) — this was hidden because round 1 scoring was correct but mis-aggregated under the new round 5 run JSONs in subsequent analyses.
+3. **The 2.4–3.1× efficiency ratio was inflated.** Real ratio is ~1.43×, still positive but much weaker.
+4. **The 2026-04-29 "8/25 BL, 13/25 ZG" reference was a phantom.** Those numbers came from before commit `8e295e0` (zengram-bench, 2026-05-02) which fixed six independent scorer bugs whose own commit message reads *"Without these, every run scored as resolved=False — six fixes turn 0/30 into 14/30."* Re-scoring the 04-29 archive with the fixed scorer gives **2/25 BL, 3/25 ZG** — same range as recent rounds. There was never a 10× regression.
+
+### True signal across rounds 1–5
+
+- Zengram wins 4/5 rounds by 1–3 resolved tasks. Round 1 is the only loss.
+- Mean delta: zengram resolves +1.2 tasks vs baseline.
+- Token ratio (zg/bl) hovers at 1.16× — zengram pays a modest token tax for the resolution wins.
+- Per-task asymmetric burn shuffling is genuine and severe, but it shuffles around a real positive aggregate.
+
+### Levers shipped so far — re-evaluation
+
+PR #25 (distance gate at 0.75), PR #26 (reasoning-noise filter), PR #28 (top-K injection cap at 5) all shipped under inflated-ratio metrics. Whether any of them moved the *real* metric is now unknown — every "this lever did/didn't move the headline" claim above this section is built on stale scoring. The mechanical post-run state validations are still valid (fact pool 68 → 41 → 31, noise % 46 → 0 → 3.2) — only the resolution/token aggregations are corrupt.
+
+### Fix
+
+Scorer fix in flight: [zengram-bench PR #10](https://github.com/genezhang/zengram-bench/pull/10) — persist `SHA-256(patch)[:16]` in each score file; treat cached scores as stale when the hash doesn't match the current run's patch. Old score files (no `patch_hash` field) are treated as stale and re-scored. Adds `--force` flag for explicit re-score.
+
+Once that lands and the corrected scoring becomes the default, re-baseline a fresh round and validate that levers PR #25/#26/#28 actually do anything before considering further shipments.
+
+### Methodology priorities going forward
+
+1. **Land the scorer fix and re-score round 5 in place.** Confirms the corrected numbers above are reproducible and not themselves an artifact of the rescoring procedure.
+2. **Run a fresh round 6 with same flags as round 5.** With deterministic scoring, the round-to-round variance is the real signal — should put a clean error bar on whether the current shipped levers help.
+3. **Audit prior elevation-plan claims.** The "round1 canonical blowups" and "round3 noise filter cleaned the fact pool" stories use mixed-validity numbers. The mechanical-state observations are still load-bearing; the resolution/token claims need re-derivation.
+4. **Stop trusting any aggregation that consumed `results/scores/` before this fix.** Including the 2026-04-29 elevation-plan headline and every survey25 round headline below.
+
+The five status snapshots below this one are preserved verbatim for the historical record but should be read as "claimed numbers" not "validated numbers" until each round is re-scored end-to-end with the fix.
+
+---
+
+## Status snapshot — 2026-05-05 (survey25_round5 — round4 reverted; lever effects are below n=1 noise floor)
+
+Re-ran round4's exact configuration (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter, fresh `BENCH_SUITE_NAME=survey25_round5`) to validate whether the round4 0.96× token ratio replicates or was lucky path-dependence.
+
+### Headline — round5 reverts to mid-pack numbers
+
+| | round3 | round4 | **round5** |
+|---|---|---|---|
+| baseline resolved | 1/24 | 1/25 | 1/25 |
+| zengram resolved | 3/24 | 3/25 | 3/25 |
+| baseline tokens | 2.07M | 2.34M | 2.10M |
+| zengram tokens | 2.53M | **2.24M** | 2.45M |
+| baseline / 1M tok | 0.48 | 0.43 | 0.48 |
+| zengram / 1M tok | 1.22 | **1.34** | 1.22 |
+| zg/bl token ratio | 1.19× | **0.96×** | **1.17×** |
+| res/Mtok ratio | 2.53× | **3.12×** | 2.55× |
+
+Round4's sub-1.0× token ratio was **lucky path-dependence**, not a stable lever effect. Round5 with identical flags lands back at 1.17× — essentially the same as round3.
+
+### 5-round summary
+
+| metric | mean | stdev | round4 (best) | round1 (worst on this metric) |
+|---|---|---|---|---|
+| zg/bl token ratio | **1.12×** | 0.11 | 0.96× (1.5σ below mean) | 1.24× |
+| res/Mtok ratio | **2.69×** | 0.28 | 3.12× (1.5σ above mean) | 2.41× |
+| zengram resolved | 3 | 0 | 3 | 3 |
+| baseline resolved | 1 | 0 | 1 | 1 |
+
+Across 5 N=1 rounds, lever shipments (PR #25 distance gate, PR #26 noise filter, PR #28 top-K cap) have moved the headline through this band but have not produced a *separable* signal above ±0.11 standard deviation on the token ratio. **Round4's win is statistically a 1.5σ outlier on a 5-sample distribution** — not strong evidence of a real lever effect.
+
+### What replicates across all 5 rounds
+
+The stable signals — independent of every lever we've shipped:
+
+1. **Resolution count: 1 baseline, 3 zengram, every single round.**
+2. **Same three zengram-resolved tasks: dj-14089, dj-15127, dj-11099** (dj-14089 also baseline-resolved every round).
+3. **dj-13297: 4-round-running zengram win** (round1 +380% blowup → round2 −52% → round3 −4% → round4 −22% → **round5 −71%**) — the most consistent zengram benefit on any single task.
+4. **Resolved/Mtok ratio always ≥ 2.4×** — zengram is unambiguously more token-efficient per resolved task across every config tested.
+
+What does *not* replicate:
+
+- Per-task asymmetric burn — dj-13821 swung 161pp between round4 (−46% win) and round5 (+115% blowup) at identical config.
+- The 3:1 resolution ratio at this scale.
+
+### Methodology conclusion — stop shipping levers, change the measurement
+
+Five rounds in, we have evidence that:
+
+- The headline (3 zengram resolves, ~1.12× token ratio, ~2.7× res/Mtok) is the **stable signal** at this measurement scale.
+- Single-flag levers (gate threshold, noise regex, top-K cap) don't move that signal above n=1 noise.
+- Per-task flips of 100+ percentage points between identical configurations are routine — measurement variance dominates lever effects.
+
+The right next steps are no longer "ship another lever":
+
+1. **Expand the task pool** to 50–100 tasks. With path-dependence dampening as the pool grows, signal floor drops proportionally — this is the cheapest leverage gain on measurement quality. Zero code changes; just a bigger `tasks/django_subset.txt`.
+2. **Switch to a more capable model** to break the 3/25 ceiling. Resolution count has been pinned at 3 zengram for 5 rounds; changing the model is the only thing that's likely to move it. The bench was originally tuned on `Qwen3-Coder-30B-A3B-Instruct` (8/25 baseline, 13/25 zengram per the 2026-04-29 snapshot), and the Qwen3-Coder-Next variant is notably less capable.
+3. **N>>1 on a smaller pool** with proper statistics. If we want to characterize lever effects below 1σ, we need 5+ reps per cell.
+
+Order: (1) costs nothing but compute time, (2) requires getting another model running on ai1, (3) is most rigorous but also most expensive. Recommend (1) immediately, (2) staged behind it.
+
+### Post-run state validation
+
+| state | round3 | round4 | round5 |
+|---|---|---|---|
+| `/project` (active facts) | 41 | 31 | **15** |
+| `/project` noise % | 0.0% | 3.2% | **0.0%** |
+| `/play` (active plays) | 9 | 12 | 11 |
+| no_edit zengram sessions | 16 | 13 | 13 |
+
+Round5's fact count dropped further to 15 — the same lever produces different accumulation patterns depending on session order. This is more evidence the run-to-run variance is structural, not noise we can paper over.
+
+---
+
 ## Status snapshot — 2026-05-05 (survey25_round4 — top-K cap on injected facts, first round zengram is absolutely cheaper than baseline)
 
 Shipped lever 3 from the round3 plan: `ZENGRAM_FACT_INJECT_LIMIT=5` (PR #28), reducing the session-preamble fact injection from top-20 to top-5. Other levers held: `ZENGRAM_FACT_MAX_DISTANCE=0.75` from PR #25, reasoning-noise filter from PR #26. Same 25-task pool, fresh `BENCH_SUITE_NAME=survey25_round4`, n=1 × 2 variants.
