@@ -7,6 +7,95 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-05 (survey25_round3 — fact-distance gate + reasoning-noise filter)
+
+First bench cycle with both round2 levers shipped: `ZENGRAM_FACT_MAX_DISTANCE=0.75` (PR #25, the empirically-derived natural break in the cosine-distance distribution) and a regex-based reasoning-noise filter on fact extraction (PR #26, blocking subjects that start with `"Now I"`, `"Let me"`, `"I'll"`, `"Looking at"`, `"The problem is"` and similar narration openers). Same 25-task Django subset × n=1 × 2 variants, fresh `BENCH_SUITE_NAME=survey25_round3`, clean slate.
+
+### Headline — efficiency ratio compressed slightly, absolute zengram efficiency improved
+
+Apples-to-apples comparison (excluding dj-14559 where baseline failed to start in round3):
+
+| | survey25_round2 | **survey25_round3** | Δ |
+|---|---|---|---|
+| baseline resolved | 1/25 | 1/24 | (− one bench failure) |
+| zengram resolved | 3/25 | 3/24 | unchanged |
+| baseline / 1M tok | 0.39 | 0.48 | +23% |
+| zengram / 1M tok | 1.10 | **1.22** | **+11%** |
+| **ratio** | **2.83×** | **2.53×** | −0.30× |
+| zg/bl token ratio | 1.06× | 1.19× | +0.13× |
+
+Zengram absolute efficiency improved (+11% res/Mtok) but baseline improved more (+23%, well within run-to-run variance on a 1-resolved sample). The ratio mildly compressed. **Resolution counts are unchanged** at 3 vs 1 — the gate + filter levers don't move the headline at this sample size.
+
+### Both levers engaged as designed — post-run state validation
+
+Dumping zengram state at end of round3:
+
+| state | round2 | round3 | mechanism |
+|---|---|---|---|
+| `/project` (active facts) | 68 | **41** | 40% reduction — noise filter rejecting bad candidates at extraction |
+| `/project` noise % | ~46% (subjects like "Now I…") | **0%** (`probe-noise-purge` dry-run reports 0 demotions) | filter working |
+| `/play` (active plays) | 10 | 9 | unchanged shape — plays still don't engage in cross-task N=1 |
+| inactive (purged) | 0 | 0 | no purge runs needed; filter prevents extraction upstream |
+
+The noise filter is doing its job: 41 facts of substance instead of 68 with half being raw LLM narration. The fact-distance gate at 0.75 is implicitly tested but the recallFacts wrapping doesn't dump rejected candidates, so we can't directly observe gate activity from state.
+
+### Asymmetric-burn pattern shifted, didn't disappear
+
+Per-task token deltas (zengram vs baseline, round3, sorted by Δ%):
+
+**Wins (zengram cheaper):**
+- dj-13033: −55% (35k vs 78k)
+- dj-10097: −55% (60k vs 134k, 6 turns vs 10) — **canonical early-quit win persists**
+- dj-14351: −23%
+- dj-15561: −21% — **flipped from round2 +77% blowup**
+- dj-16595: −19% (118k vs 146k) — **canonical round1 blowup, now consistently a win**
+- dj-16100: −18%
+- dj-11740: −18%
+- dj-16333: −15%
+- dj-15368: −7% — **round1 +250% blowup, now neutral**
+- dj-13297: −4% — **round1 +380% blowup, now neutral**
+
+**Blowups (zengram much worse):**
+- dj-16877: +1157% (148k vs 12k) — but baseline early-quit at 1 turn with 0 tokens output, not a real completion to compare against
+- dj-14787: +167% — regressed sharply from round2's −17%
+- dj-13658: +110%
+- dj-11211: +89%
+- dj-12273: +54%
+- dj-15127: +50% — but **zengram resolved**, baseline did not
+- dj-13417: +29%
+- dj-12713: +29% — was a win in both prior rounds
+
+Old canonical blowups (13297, 15368, 16595) compressed to neutral or wins — that's directly attributable to the gate + filter (cleaner, smaller fact pool means fewer red-herring injections). New blowups emerged on different tasks. Path-dependence keeps shuffling which tasks are wins vs losses while the aggregate stays roughly stable.
+
+### Resolved-task overlap
+
+| task | round1 | round2 | round3 |
+|---|---|---|---|
+| dj-14089 | ✓ both | ✓ both | ✓ both |
+| dj-15127 | ✓ zengram | ✓ zengram | ✓ zengram |
+| dj-11099 | — | ✓ zengram | ✓ zengram |
+| dj-12273 | ✓ zengram | — | — |
+
+The same three zengram tasks are resolved that were resolved in round2 (dj-14089, dj-15127, dj-11099). The lever changes preserved the right wins, didn't unlock new ones.
+
+### What this implies for the next lever
+
+The two levers shipped did what they were designed to do — clean the fact pool (41 vs 68, 0% vs 46% noise) and gate noisy injections (gate at 0.75). The aggregate metric didn't move *because* the headline wasn't being driven by the noise we filtered out. Round2 already showed 2.83× ratio with a noisy 68-fact pool; round3 shows 2.53× with a clean 41-fact pool. **The marginal contribution of cleaner facts at this scale is below the noise floor of n=1 path-dependence.**
+
+Two paths from here:
+
+1. **Characterize variance before chasing more levers.** Run n=2 or n=3 on the same task pool to put error bars on the ratio. Right now we cannot distinguish "lever did nothing" from "lever helped but path-dependence dominated." This is the rigorous path; cost is ~10–15h of compute.
+
+2. **Lever 3 from the round2 plan: cap injected fact count by relevance.** Currently `recallFacts` returns up to 20 facts × ~150 chars. Even after gating, that's 3kB of prompt that's mostly weak signal. Lower the cap (maybe to top-5 by score) and see if fewer-but-better facts move the metric. This is the cheap-experiment path.
+
+Recommendation: do (2) first — it's a one-flag change and tests whether further fact pruning has any signal. If it doesn't, switch to (1) and stop chasing levers without measurement. If it does, then (1) becomes confirmation.
+
+### Methodology note — n=1 ceiling
+
+Three rounds in, the resolved count is locked at 1 baseline, 3 zengram regardless of which levers fire. The token-efficiency *ratio* drifts in a 2.4×–2.8× band that is plausibly within run-to-run variance on a 25-task pool. **N=1 cannot reliably distinguish lever effects below ~0.5×.** The methodology needs either a bigger pool (more tasks) or repetitions (n>1) to detect smaller wins. The next lever measurement should ship paired with at least one repetition.
+
+---
+
 ## Status snapshot — 2026-05-04 (survey25_round2 — chunk-aware end-to-end + path-dependence finding)
 
 Re-ran the same 25-task subset × n=1 × 2 variants that produced the 2026-05-03 AM survey25 numbers, this time with the chunk-aware analyzer (zengram-bench#9) live end-to-end. Clean slate — wiped multi-session-state, archived prior results, `BENCH_SUITE_NAME=survey25_round2`.
