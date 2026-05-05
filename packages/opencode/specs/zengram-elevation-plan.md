@@ -7,6 +7,92 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-05 (survey25_round4 — top-K cap on injected facts, first round zengram is absolutely cheaper than baseline)
+
+Shipped lever 3 from the round3 plan: `ZENGRAM_FACT_INJECT_LIMIT=5` (PR #28), reducing the session-preamble fact injection from top-20 to top-5. Other levers held: `ZENGRAM_FACT_MAX_DISTANCE=0.75` from PR #25, reasoning-noise filter from PR #26. Same 25-task pool, fresh `BENCH_SUITE_NAME=survey25_round4`, n=1 × 2 variants.
+
+### Headline — first round where zengram beats baseline on absolute tokens
+
+|  | round2 | round3 | **round4** | Δ vs round3 |
+|---|---|---|---|---|
+| baseline resolved | 1/25 | 1/24 | 1/25 | — |
+| zengram resolved | 3/25 | 3/24 | 3/25 | unchanged |
+| baseline tokens | 2.56M | 2.07M | 2.34M | +13% |
+| zengram tokens | 2.72M | 2.53M | **2.24M** | **−11.4%** |
+| baseline / 1M tok | 0.39 | 0.48 | 0.43 | — |
+| zengram / 1M tok | 1.10 | 1.22 | **1.34** | +10% |
+| zg/bl token ratio | 1.06× | 1.19× | **0.96×** | **first round < 1.00** |
+| **res/Mtok ratio** | 2.83× | 2.53× | **3.12×** | **+23%, best across all rounds** |
+
+The 0.96× token ratio is the headline: with top-5 injection plus the round3 levers, **zengram is now cheaper in absolute aggregate than the SQLite baseline** while still resolving 3× as many tasks. This is the first time we've seen recall pay for itself in token cost on the survey25 pool.
+
+### Asymmetric-burn pattern shifted heavily — round3 blowups flipped to wins
+
+The bigger move is per-task. Round3's worst zengram blowups all flipped to wins or near-wins:
+
+| task | round1 Δ% | round2 Δ% | round3 Δ% | **round4 Δ%** |
+|---|---|---|---|---|
+| dj-14787 | −58% | −17% | **+167%** | **−31%** |
+| dj-13658 | +60% | +33% | **+110%** | **−65%** |
+| dj-11211 | small | parity | **+89%** | **−27%** |
+| dj-12273 | parity | parity | +54% | **−54%** |
+| dj-12713 | −32% | parity | +29% | **−46%** |
+| dj-13821 | small | parity | +13% | **−46%** |
+| dj-11999 | parity | +87% | +7% | **−35%** |
+| dj-13297 | +380% | −52% | −4% | **−22%** |
+
+Eight tasks where round3 was worse-than-baseline are round4 wins. dj-13297 — the canonical round1 blowup — has now been a win three rounds running.
+
+But path-dependence keeps moving the boundary: some round3 wins flipped to losses in round4:
+
+| task | round3 Δ% | **round4 Δ%** |
+|---|---|---|
+| dj-10097 | **−55%** | **+66%** |
+| dj-16100 | **−18%** | **+153%** |
+| dj-16333 | **−15%** | **+64%** |
+| dj-13033 | **−55%** | +14% |
+| dj-13417 | +29% | +52% |
+
+The aggregate moved decisively in zengram's favor (2.53M → 2.24M tokens), but at the per-task level the shuffling is severe enough that we can't yet say *which* tasks the lever helps consistently. Resolved tasks unchanged: dj-14089 (both), dj-15127 (zengram), dj-11099 (zengram) — same three since round2.
+
+### Post-run state validation — lever engaged
+
+| state | round3 | round4 | mechanism |
+|---|---|---|---|
+| `/project` (active facts) | 41 | **31** | smaller cap → less reflection-driven accumulation across sessions |
+| `/project` noise % | 0.0% | 3.2% | one fact slipped the regex; tolerable, not perfect |
+| `/play` (active plays) | 9 | 12 | unchanged shape (cross-task plays still don't engage at d≈0.7+) |
+| no_edit sessions (zengram) | 16 | 13 | −19% — model gives up empty-handed less often with smaller prompt |
+
+The fact pool keeps shrinking with each lever — 68 (round2) → 41 (round3 noise filter) → 31 (round4 top-5 cap). 3.2% noise leak is one fact in 31; the regex isn't catching every variant but the broader trajectory holds.
+
+### Why is this a bigger move than expected?
+
+20-fact injection at ~150 chars/fact = ~3kB of prompt. Top-5 reduces that to ~750 bytes. Two things plausibly compound:
+
+1. **Less prompt slop per turn.** A model on a 15-turn budget benefits from a tighter system block — the same input tokens being injected on every turn × 15 turns is significant. ~3kB × 15 = 45kB; ~750B × 15 = 11kB. Saving ~34kB of prompt-tokens-per-session × 25 sessions ≈ 850kB of zengram-side savings, which roughly tracks with the 290k aggregate token reduction (zengram cache amplifies savings).
+
+2. **Less anchoring on weak retrieval.** Top-20 includes facts at the score floor — semantically related but not directly useful. The model treats the system-block as authoritative; weak signal in there can pull behavior off the path. Top-5 keeps only high-confidence retrievals.
+
+Neither effect is provable from one round, but both are consistent with the magnitude of the move.
+
+### Critical caveat — n=1 still dominates
+
+Round3's takeaway was "n=1 cannot distinguish lever effects below ~0.5×." Round4's lever moved the ratio +0.59× and the token ratio across the 1.0× threshold. That's *plausibly* above the n=1 noise floor — but the per-task shuffling magnitude (dj-10097 went from −55% to +66%, 121 percentage points on a single task) means one bad round could easily revert it.
+
+**The right next step is round5 with identical flags** to put error bars on the round4 result. If round5 confirms zengram-absolute ≤ baseline (token ratio ≤ 1.0), the lever effect is real. If round5 reverts to round3-style numbers (1.1–1.2× ratio), this was lucky path-dependence and we should look elsewhere.
+
+A cheaper alternative to a full round5 would be expanding the task pool to 50+ tasks, which dilutes per-task variance — but no such pool is staged. Round5 reps is the simplest validation.
+
+### Open questions for round5
+
+- Does the 0.96× token ratio replicate, or revert to ≥1.0×?
+- Does dj-13297 hold its win streak (now 3 rounds)?
+- Do the round4 flips (dj-14787, dj-13658, dj-11211, dj-12273) hold, or were they path-dependent?
+- Same three resolved tasks (dj-14089, dj-15127, dj-11099) — does the resolution count ever break out of 3/25 with this model on this pool, or is it a model-capability ceiling?
+
+---
+
 ## Status snapshot — 2026-05-05 (survey25_round3 — fact-distance gate + reasoning-noise filter)
 
 First bench cycle with both round2 levers shipped: `ZENGRAM_FACT_MAX_DISTANCE=0.75` (PR #25, the empirically-derived natural break in the cosine-distance distribution) and a regex-based reasoning-noise filter on fact extraction (PR #26, blocking subjects that start with `"Now I"`, `"Let me"`, `"I'll"`, `"Looking at"`, `"The problem is"` and similar narration openers). Same 25-task Django subset × n=1 × 2 variants, fresh `BENCH_SUITE_NAME=survey25_round3`, clean slate.
