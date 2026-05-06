@@ -7,6 +7,64 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-05 (survey25_round6 — first round under fully-fixed measurement substrate)
+
+First bench cycle under both the scorer fix (zengram-bench#10, patch-hash invalidation) and the analyzer integrity gate (zengram-bench#11, refuses to publish stale aggregates). Same flags as round 5 (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter), fresh `BENCH_SUITE_NAME=survey25_round6`. Now we are actually measuring what we think we are measuring.
+
+### Round 6 vs round 5 (both correctly scored)
+
+| | round 5 | **round 6** |
+|---|---|---|
+| BL resolved | 2/25 | **3/25** |
+| ZG resolved | 5/25 | **3/25** |
+| tok ratio (zg/bl) | 1.17× | **0.93×** |
+| res/Mtok ratio | 2.14× | **1.08×** |
+| ZG advantage | +3 resolves | **0 resolves** |
+
+Identical flags, fully-corrected scoring, opposite outcomes. Round 5 had zengram resolving three tasks baseline didn't; round 6 both sides resolve the same three (dj-11099, dj-14089, dj-14559). dj-15127 — the canonical zengram-only winner across rounds 2–5 — didn't resolve at all this round.
+
+### 6-round summary (all corrected)
+
+| round | BL | ZG | tok ratio | res/Mtok |
+|---|---|---|---|---|
+| 1 | 3 | 2 | 1.38× | 0.48× |
+| 2 | 2 | 4 | 1.06× | 1.89× |
+| 3 | 2 | 3 | 1.22× | 1.23× |
+| 4 | 3 | 4 | 0.96× | 1.39× |
+| 5 | 2 | 5 | 1.17× | 2.14× |
+| 6 | 3 | 3 | 0.93× | 1.08× |
+| **mean** | **2.5** | **3.5** | **1.12×** | **1.37×** |
+
+Real signal: zengram wins by **mean +1.0 resolved task** (range −1 to +3). Token tax ~1.12×. res/Mtok ratio 1.37× — positive but the variance band (0.48× to 2.14×) is wider than the mean effect, so any single round in isolation can show "zengram lost" or "zengram won by 2×" under identical configuration.
+
+### Per-task asymmetric burn — wins bigger than losses
+
+Round 6 zengram cheaper-than-baseline wins (top): dj-12713 −88%, dj-16333 −81%, dj-13821 −53%, dj-14559 −51%, dj-13297 −45%, dj-11211 −45%. Round 6 zengram blowups (top): dj-16877 +201%, dj-10097 +152%, dj-11099 +73%. 11 wins / 9 losses / 5 near-ties. The wins are bigger in magnitude, which is why aggregate tokens land slightly cheaper despite roughly equal counts.
+
+### Conclusion: lever-vs-variance ratio is too low at n=1 × 25 tasks
+
+Across six rounds we now have clean evidence that:
+
+- The fully-fixed substrate produces consistent ok-status integrity reports → we are measuring what we think we are measuring.
+- Zengram wins on aggregate (mean +1.0 task, +37% res/Mtok), but variance dominates any single round.
+- The res/Mtok variance band (0.48–2.14×) is **wider than any per-lever delta we have ever measured**. Single-flag lever changes cannot rise above this floor.
+
+### Next move
+
+Stop running same-config repetitions — each round costs ~5–6h compute and adds one data point. Variance-reduction-per-compute-spent is much higher with **task pool expansion**: doubling the pool from 25 to 50 tasks roughly halves the per-task variance contribution to the aggregate, and is a one-time cost (gather tasks, prime the repo cache).
+
+Concrete pool-expansion plan:
+1. Pull the next 25 unused-but-cheap Django tasks from SWE-bench Verified (filter by patch-size and base_commit-cache-availability).
+2. Add them to `tasks/django_subset.txt` (rename to `django_50.txt`).
+3. Smoke-test five new tasks under both variants to confirm they score correctly.
+4. Run round 7 on the 50-task pool with round 5's flags. ~10–12h compute.
+
+If round 7 produces a tighter variance band on res/Mtok (e.g. ±0.3× instead of ±0.7×), then re-running rounds 5/6's flags on the 50-pool gives a real lever-effect estimate. If the band is still wide, expand again to 75 or 100.
+
+The shipped levers (PR #25 distance gate, PR #26 noise filter, PR #28 top-K cap) are not necessarily wrong — they are just unmeasurable at this pool size.
+
+---
+
 ## ⚠️ Status snapshot — 2026-05-05 late (CORRECTION: scorer caching artifact invalidates round1–5 narrative)
 
 Investigation triggered by the user pointing out that the "Qwen3-Coder-30B-A3B vs Next" model-swap explanation for the resolution regression couldn't be right (both rounds were on Next). Root-causing the actual regression turned up a much bigger problem.
