@@ -7,6 +7,68 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-06 (survey50_round7 — pool doubled to 50 tasks, headline narrows further)
+
+First round on the 50-task pool (`tasks/django_50.txt` = original 25 + 25 new Django tasks selected for FTP≥1, 5≤PTP≤200, patch≤50 lines). Same flags as rounds 5/6 (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter), fresh `BENCH_SUITE_NAME=survey50_round7`, n=1 × 2 variants.
+
+### Mid-run incident: zengram backend wedged at task 37, 14 phantom completions
+
+`opencode-fork` hung for ~7.9h on dj-13794, then every subsequent zengram task returned in ~96s with empty patch but **`status: "completed"`** and 0 turns / 0 tokens. The `run-zengram.sh` adapter wraps opencode-fork with `... || { echo ...; }` so the bash exit was always 0; the harness took that at face value. 14 of 50 zengram runs were silently fake.
+
+Fix: zengram-bench PR #12 ([fix(harness)](https://github.com/genezhang/zengram-bench/pull/12)) — treat `usage.turns === 0` as `failed` regardless of subprocess exit. This is the write-side counterpart to PR #11's read-side integrity gate: PR #11 catches *stale* scores, PR #12 catches *fake-completed* runs. Together they close the silent-data-corruption loop on both ends.
+
+Recovery: deleted the 14 phantom run JSONs and re-ran zengram-only on the same `survey50_round7` pinned dir (preserves multi-session continuity). All 14 completed cleanly (3–15 turns each), including dj-13794 itself which finished in 13.6 min the second time. Root cause of the original wedge is unidentified — single occurrence so far, watching for repro.
+
+### Headline numbers (50 tasks, all 100 runs valid)
+
+| | baseline | zengram | ratio |
+|---|---|---|---|
+| Resolved | 3/50 (6.0%) | 4/50 (8.0%) | +33% |
+| Total tokens | 4.73M | 5.02M | 1.063× |
+| **Resolved / 1M tok ★** | **0.63** | **0.80** | **1.27× ZG** |
+| Median tokens / run | 89.1k | 89.4k | 1.003× |
+| Median turns / run | 15 | 15 | 1.00× |
+| no_edit runs | 28/50 | 26/50 | −2 |
+
+`Score integrity: ok (100 runs ↔ scores)` — both gates clean.
+
+### What changed vs the 6-round mean
+
+| | 6-round mean (n=25) | round 7 (n=50) |
+|---|---|---|
+| BL res | 2.5/25 (10%) | 3/50 (6%) |
+| ZG res | 3.5/25 (14%) | 4/50 (8%) |
+| tok ratio | 1.12× | **1.063×** *(tightest ever)* |
+| res/Mtok ratio | 1.37× | **1.27×** |
+
+Resolution rate is lower in absolute percent on the bigger pool — expected, the new 25 tasks were sampled across the same difficulty band but include more "<15 min fix" entries that the agent can still fail on; harder tail dominates. Both variants pay this cost equally.
+
+The token ratio compression to **1.063×** is the most striking single-round result we have. Across rounds 1–6 it ranged 0.93×–1.38× with mean 1.12×; round 7 is at the low edge. Either this round got lucky, or doubling the pool genuinely averages out the per-task burn shuffling that has been driving most of the variance. We need round 8 (same config) to tell.
+
+### Variance hypothesis: did pool expansion help?
+
+Theory was that doubling the pool roughly halves per-task variance contribution to the aggregate. We can't confirm that from one round — variance is a cross-round property — but the within-round signal is consistent with it: round 7's resolution counts (3 vs 4) are exactly the kind of tight margin we couldn't distinguish from noise on the 25-pool.
+
+Next step: round 8 on the 50-pool, same config, to put error bars on round 7. If round 8 lands in the 0.95×–1.10× token-ratio band and 1.0×–1.5× res/Mtok band, the variance band has genuinely tightened by ~2× and lever measurements become viable. If round 8 swings as wide as the 25-pool rounds did, the pool size wasn't the binding constraint.
+
+### What this confirms about the levers shipped so far
+
+PR #25 (distance gate), PR #26 (noise filter), PR #28 (top-K cap) collectively produced a token ratio of 1.063× in round 7 — the closest zengram has ever come to matching baseline on absolute tokens while still resolving more tasks. Whether each individual lever contributes to that, vs being neutral, is still unmeasurable; but the *stack* is no longer net-cost.
+
+### Open questions for round 8
+
+1. Token ratio: is 1.063× the new normal, or was round 7 a lucky draw? (n=2 puts a real bound.)
+2. Resolution delta: does ZG +1 vs BL hold on the 50-pool, or shrink to ±0?
+3. The unidentified wedge that produced 14 phantom completions — does it repro on round 8 with the same pinned-dir state?
+
+### Next move
+
+Run round 8 on the 50-pool with **identical** flags. Same suite name? **No** — fresh `survey50_round8`. Reusing round 7's pinned dir would conflate "second measurement" with "second-pass over already-warmed memory," and we want the variance estimate, not the multi-session compounding effect.
+
+If round 8 confirms the tightened band, the agenda for round 9+ becomes: **isolate the levers**. Run with each of {distance gate off, noise filter off, top-K cap off} to attribute the token-ratio compression to specific shipped code, rather than assuming all three are pulling.
+
+---
+
 ## Status snapshot — 2026-05-05 (survey25_round6 — first round under fully-fixed measurement substrate)
 
 First bench cycle under both the scorer fix (zengram-bench#10, patch-hash invalidation) and the analyzer integrity gate (zengram-bench#11, refuses to publish stale aggregates). Same flags as round 5 (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter), fresh `BENCH_SUITE_NAME=survey25_round6`. Now we are actually measuring what we think we are measuring.
