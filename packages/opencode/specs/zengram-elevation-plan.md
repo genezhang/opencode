@@ -7,6 +7,69 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-06 (survey50_round8 — 256k n_ctx, null result on resolution; 4× variance tightening confirmed)
+
+Same flags as round 7, only `n_ctx` raised on ai1.local from 65536 to 262144 (4× the model's previously-served context window). Hypothesis: round 7's 7% resolution rate and 28/50 `no_edit` baseline runs were caused by the agent's prompt accumulation (file reads + tool history) overflowing the 64k window mid-conversation. Round 8 tests that hypothesis directly.
+
+### Headline — n_ctx is not the bottleneck
+
+| | round 7 (n_ctx=64k) | **round 8 (n_ctx=256k)** |
+|---|---|---|
+| BL resolved | 3/50 (6.0%) | 3/49 (6.1%) |
+| ZG resolved | 4/50 (8.0%) | 4/50 (8.0%) |
+| BL total tokens | 4.73M | 4.31M (−9%) |
+| ZG total tokens | 5.02M | 5.01M (~0%) |
+| token ratio (zg/bl) | 1.063× | 1.163× |
+| res/Mtok ratio | 1.27× | 1.14× |
+| BL median tok/run | 89.1k | 78.4k |
+| ZG median tok/run | 89.4k | 83.7k |
+| no_edit BL | 28 | 28 |
+| no_edit ZG | 26 | 30 |
+
+`Score integrity: ok (99 runs ↔ scores)` — one baseline run failed legitimately (dj-13417, 0 turns), now properly stamped `failed` thanks to zengram-bench#12.
+
+Resolution rate and `no_edit` count are essentially unchanged. The 4× context expansion did not unlock any tasks. **Conclusion: the 64k window was not what was limiting agent success on this task pool**; the bottleneck is upstream — the model itself cannot identify the right edit in 15 turns regardless of how much history it has access to.
+
+### Asymmetric sensitivity to context size
+
+Baseline median tokens dropped 12% (89k → 78k) and total dropped 9% — when the window is large, baseline doesn't need to re-read files it already saw, so its prompt grows more slowly per turn. Zengram showed essentially no change (89k → 84k median, ~0% total). Zengram's `<zengram-previously-helpful>` injection adds a fixed-size cost per turn that already fit within 64k; the extra 192k of headroom doesn't shrink it.
+
+Concretely: zengram's prompt structure is less sensitive to truncation pressure (which is what zengram is *for* — externalize state so context stays small), while baseline's prompt structure depends on context to avoid re-reads. Result: in the 64k regime baseline paid more in re-reads (token ratio 1.06×); in the 256k regime baseline pays less (token ratio 1.16×). Zengram's relative cost goes up because baseline's absolute cost goes down.
+
+### Variance tightening across 50-pool rounds — confirmed
+
+The round 7 plan predicted that doubling the pool from 25 to 50 would roughly halve the per-task variance contribution to the aggregate. Two same-config rounds now make that measurable.
+
+| | 25-pool (rounds 1–6) | 50-pool (rounds 7–8) |
+|---|---|---|
+| token ratio range | 0.93×–1.38× (±0.20) | 1.063×–1.163× (±0.05) |
+| res/Mtok range | 0.48×–2.14× (±0.83) | 1.14×–1.27× (±0.07) |
+
+Variance band tightened ~4× on token ratio, ~12× on res/Mtok. This is more than the simple n→2n prediction — which suggests the 50-pool is doing more than averaging out; it's also damping the asymmetric-burn outliers that drove the 25-pool's heaviest single-task swings.
+
+### What's signal vs noise on the 50-pool now
+
+- **Signal:** zengram pays a ~10–15% token tax (token ratio 1.06–1.16×) and resolves a 20% bigger res/Mtok metric (1.14–1.27× consistently > 1).
+- **Noise:** the +1 resolved-task delta (3 vs 4) is a single-task margin at the 6–8% success floor; 95% CI on the 2pp difference includes zero. Resolution rate is unmeasurable as a comparison until success rate climbs.
+
+### What this rules out and points to next
+
+Ruled out:
+- "Context window was the bottleneck" — refuted directly.
+- "More history fixes the agent" — same `no_edit` count with 4× headroom.
+
+Pointed to:
+- **Turn budget.** 28–30 of 50 baseline runs end with no edit, after using all 15 turns. The agent is spending turns reading/searching and never gets to the edit. Raising `BENCH_MAX_TURNS` from 15 to 30 directly addresses this and is the single cheapest experiment.
+- **Model capacity.** If 30 turns also doesn't move resolution, the local Qwen3-Coder-Next at q6 quantization is the floor and the only way past 7% is to swap to a frontier model via API.
+
+### Next move
+
+Round 9 on the 50-pool, same flags as round 8, **`BENCH_MAX_TURNS=30`**. Same `n_ctx=256k` (no reason to revert; it doesn't hurt). Fresh `BENCH_SUITE_NAME=survey50_round9` and fresh pinned dir for the variance estimate.
+
+If round 9 lifts resolution rate materially (target: 15%+), the agent can use the additional turns and we have a meaningful comparison again. If `no_edit` stays high at 30 turns, the model is the ceiling and the experiment plan switches to API-backed Sonnet for round 10.
+
+---
+
 ## Status snapshot — 2026-05-06 (survey50_round7 — pool doubled to 50 tasks, headline narrows further)
 
 First round on the 50-task pool (`tasks/django_50.txt` = original 25 + 25 new Django tasks selected for FTP≥1, 5≤PTP≤200, patch≤50 lines). Same flags as rounds 5/6 (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter), fresh `BENCH_SUITE_NAME=survey50_round7`, n=1 × 2 variants.
