@@ -42,6 +42,31 @@ export type KnowledgeEntry = {
 }
 
 /**
+ * Strip leading boilerplate from user text before using it as a recall query.
+ *
+ * Round-9 telemetry showed every task's top-1 fact distance was identical
+ * (0.689) — the embedding was dominated by a ~3000-char bench preamble that
+ * preceded the actual problem statement, so the "nearest fact" was the same
+ * for every task regardless of content. The fix: when the text contains a
+ * Markdown "---" separator with substantive content after it, treat what
+ * comes before as boilerplate and drop it.
+ *
+ * Also caps at the LAST 2000 chars when no separator exists — for tool-result
+ * follow-up messages the actual content typically lives at the tail, and
+ * embedding very long inputs muddies similarity with low-information tokens.
+ */
+export function extractRecallContext(text: string | undefined): string | undefined {
+  if (!text) return text
+  const sep = "\n---\n"
+  const lastSep = text.lastIndexOf(sep)
+  if (lastSep > 0 && text.length - lastSep - sep.length >= 50) {
+    text = text.slice(lastSep + sep.length).trim()
+  }
+  if (text.length > 2000) text = text.slice(-2000)
+  return text
+}
+
+/**
  * Distance gate for recallFacts (default: off). When ZENGRAM_FACT_MAX_DISTANCE
  * is set to a positive number, vector-path facts whose embedding distance
  * to the query exceeds the threshold are dropped — analogous to
@@ -216,6 +241,9 @@ export async function recallFacts(input: {
           total: vecMatches.length,
           kept: gated.length,
           maxDist,
+          queryLen: input.context.length,
+          topDistances: vecMatches.slice(0, 5).map((r) => Number(r.distance ?? -1)),
+          keptSubjects: gated.slice(0, 3).map((r) => (r.subject ?? "").slice(0, 60)),
         })
       }
 
@@ -839,8 +867,13 @@ const PLAY_SUBJECT_MAX = 120
 
 function playSubjectForSession(sessionId: string, problem: string): string {
   // Use a session-scoped prefix so the same session can UPSERT its own row.
-  // The problem-statement excerpt is the semantic payload for embedding.
-  const excerpt = problem.replace(/\s+/g, " ").trim().slice(0, PLAY_SUBJECT_MAX)
+  // The problem-statement excerpt is the semantic payload for embedding —
+  // run extractRecallContext first to strip any leading boilerplate so the
+  // PLAY_SUBJECT_MAX-byte budget actually holds problem-specific content
+  // instead of e.g. the bench preamble (round 9: 29/29 plays had subjects
+  // that were 100% preamble text, making play recall functionally dead).
+  const stripped = extractRecallContext(problem) ?? problem
+  const excerpt = stripped.replace(/\s+/g, " ").trim().slice(0, PLAY_SUBJECT_MAX)
   return `[${sessionId}] ${excerpt}`
 }
 
