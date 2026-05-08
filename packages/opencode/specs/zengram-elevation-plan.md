@@ -7,6 +7,84 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-07 (survey50_round9 — turn cap doubled to 30, zengram becomes absolutely cheaper)
+
+Skipped round 8 (would have been a same-config replicate of round 7) in favour of changing one lever: **`BENCH_MAX_TURNS=30`** (was 15). Hypothesis: under a tight turn cap baseline can't run far enough to express its inefficiency; under a looser cap, baseline burns to the wall while zengram (which terminates earlier when the fact tells it the answer) does not. Round 7 already showed median turns 15/15 — both hugging the cap — which makes 15 a measurement floor, not a real ceiling.
+
+Same flags otherwise: `ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter, `BENCH_PREAMBLE=1`, `OPENCODE_BENCH_TOP_P=0.8`, `OPENCODE_BENCH_TEMPERATURE=0.1`. Fresh `BENCH_SUITE_NAME=survey50_round9`, `tasks/django_50.txt`, n=1 × 2 variants, `--multi-session`.
+
+### Mid-run incidents
+
+1. **Round-8 wedge inherited.** A previous attempt (round 8 with cap=30) wedged on dj-13033 zengram for ~8.5h past the 30-min `BENCH_TIMEOUT_MS` because `execFile`'s built-in timeout sends SIGTERM only to the immediate child (bash); the `bash → exec bun` chain left the bun grandchild orphaned. Killed manually; the adapter's 90s no-step retry path then completed dj-13033 cleanly and the harness advanced.
+2. **Fix shipped.** zengram-bench PR #13 ([fix(harness)](https://github.com/genezhang/zengram-bench/pull/13)) replaces `execFile` with manual `spawn` + `detached: true` and `process.kill(-pid, "SIGKILL")` on timeout — kills the entire process group regardless of how the wrapper handles signals. Defense-in-depth with PR #12: PR #12 catches *post-exit* phantoms, PR #13 ensures the wrapper actually dies when the harness gives up.
+3. **Machine crash mid-task-96.** This host (not ai1.local) crashed under unrelated load while running task 96. The harness's per-task result-file existence check (`run.ts:116`) made resume trivial — re-running the same command skipped the 95 completed tasks and finished the last 5 in ~30 min.
+4. **One missing trajectory.** dj-13033 zengram completed but didn't write `trajectory.json` (artifact of the original wedge / forced kill on the round-8 attempt; the round-9 multi-session pinned dir reused the partial state). Patch and usage are present, so it counts toward resolution and tokens; it's just absent from trajectory aggregates (n=49 instead of 50 there).
+
+### Headline numbers (50 tasks, 100 runs valid)
+
+| | baseline | zengram | ratio |
+|---|---|---|---|
+| Resolved | 3/50 (6.0%) | 4/50 (8.0%) | +33% |
+| Total tokens | 7.42M | **5.99M** | **0.807× ZG** |
+| **Resolved / 1M tok ★** | **0.40** | **0.67** | **1.67× ZG** |
+| Median tokens / run | 121.0k | 116.7k | 0.965× |
+| Median turns / run | **26.5** | **16.0** | **0.60× ZG** |
+| no_edit runs | 19/50 | 20/49 | +1 |
+
+`Score integrity: ok (100 runs ↔ scores)`. Wasted-action share: useful 96.2% bl / 97.5% zg; redundant_read 2.5% / 1.8%; premature_test 1.3% / 0.7%.
+
+### What changed vs round 7
+
+| | round 7 (cap=15) | **round 9 (cap=30)** |
+|---|---|---|
+| BL tokens | 4.73M | 7.42M (+57%) |
+| ZG tokens | 5.02M | 5.99M (+19%) |
+| **tok ratio (zg/bl)** | 1.063× | **0.807×** *(zengram cheaper for the first time on this pool)* |
+| BL median turns | 15 | 26.5 |
+| ZG median turns | 15 | **16** |
+| BL resolved | 3/50 | 3/50 |
+| ZG resolved | 4/50 | 4/50 |
+
+The resolution counts are unchanged. The story is entirely on the cost axis: doubling the cap nearly doubled baseline tokens (4.73M → 7.42M) and barely moved zengram (5.02M → 5.99M, +19%). Zengram's median turns went from 15 to 16 — meaning round 7's 15-turn cap was effectively binding for both variants, but only the baseline kept needing more rope when given it. Zengram converges, baseline drifts.
+
+### Resolved-task overlap
+
+Resolved tasks (round 9):
+- **Both**: dj-11099, dj-13670, dj-14089
+- **Zengram-only**: dj-15368
+- **Baseline-only**: (none)
+
+Same shape as round 7 (one zg-only winner, no bl-only). Across rounds 5/6/7/9 zengram has resolved a strict superset of baseline on the 25-and-50 pools.
+
+### What this confirms about the levers
+
+The compounding picture across the shipped levers (PR #25 distance gate, PR #26 noise filter, PR #28 top-K cap):
+
+- Round 5–6 (25-pool, cap=15): zg +1.0 task on average, tok ratio ~1.05× (range 0.93–1.17)
+- Round 7 (50-pool, cap=15): zg +1, tok ratio 1.063×
+- **Round 9 (50-pool, cap=30): zg +1, tok ratio 0.807×**
+
+Resolution-count delta is **structural** (consistently +1) and now we're seeing genuine token *savings* once the harness gives baseline enough rope to over-spend. Mission criteria from CLAUDE.md (`fewer turns, fewer tokens, match or beat baseline quality`): all three met under the 30-turn cap.
+
+### Open questions for round 10
+
+1. **Variance.** This is one round at cap=30. Round 7's tok ratio was 1.063×; if round 10 (same cap=30 config) lands at e.g. 0.95×, the win is real but smaller; if it lands at 1.10×, this round was lucky. n=2 puts the first error bar on the cap=30 finding.
+2. **Where does baseline burn the extra 2.7M tokens?** Round-7-vs-9 baseline went from 4.73M to 7.42M: that's 2.7M tokens with **zero** extra resolves. Are these high-redundancy runs concentrated on the same tasks each round, or scattered? If concentrated, those tasks are baseline cap-failure modes worth profiling.
+3. **Cap=30 effect on zengram-only solves.** Round 7 zg-only: 1 task (dj-15127 — historical). Round 9 zg-only: 1 task (dj-15368, new). Different task each time. Is the +1 robust across cap settings, or is it a "any one of N hard tasks happens to flip" effect at the noise floor?
+4. **dj-13033 wedge root cause.** Two attempts in a row wedged on the same task. Could be a Zengram-state interaction (multi-session pinned dir poisoning), a model-output pathology that loops, or unrelated. Worth a one-off zengram-only repro on dj-13033 with a fresh pinned dir before round 10.
+
+### Next move
+
+Run **round 10 with identical cap=30 config** and a fresh `BENCH_SUITE_NAME=survey50_round10`. Two purposes:
+- Replicate the 0.807× tok ratio (or not).
+- Confirm the +1 resolved-task delta isn't drifting.
+
+If round 10 lands tok ratio ≤ 0.95× and ZG ≥ BL on resolves, the cap=30 result is durable and **the lever-isolation agenda from the round-7 plan can finally start** (turn off distance gate / noise filter / top-K cap one at a time and measure). Until n=2 confirms cap=30, lever isolation is premature.
+
+If round 10 swings back to ≥ 1.0× tok ratio, round 9's win is a single-round artifact and we go back to investigating where round-7-to-round-9 baseline tokens came from (open question 2) before believing cap=30 is the right operating point.
+
+---
+
 ## Status snapshot — 2026-05-06 (survey50_round7 — pool doubled to 50 tasks, headline narrows further)
 
 First round on the 50-task pool (`tasks/django_50.txt` = original 25 + 25 new Django tasks selected for FTP≥1, 5≤PTP≤200, patch≤50 lines). Same flags as rounds 5/6 (`ZENGRAM_FACT_INJECT_LIMIT=5`, `ZENGRAM_FACT_MAX_DISTANCE=0.75`, noise filter), fresh `BENCH_SUITE_NAME=survey50_round7`, n=1 × 2 variants.
