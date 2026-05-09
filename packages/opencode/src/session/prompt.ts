@@ -50,6 +50,7 @@ import {
   formatWorkspaceBlock,
   recallPlays,
   formatPlaysBlock,
+  extractRecallContext,
 } from "@/knowledge"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
@@ -1511,6 +1512,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   .filter((p): p is Extract<MessageV2.Part, { type: "text" }> => p.type === "text")
                   .map((p) => p.text)
                   .join(" ") || ""
+                // Strip boilerplate (e.g. bench preamble) before embedding.
+                // Without this, a long preamble dominates the embedding so
+                // every task's "nearest fact" collapses to the same row —
+                // measured on round 9: top-1 distance was identically 0.689
+                // for all 50 tasks under the un-stripped form.
+                const recallCtx = extractRecallContext(userText)
                 const [skills, env, instructions, modelMsgs, knowledgeFacts, workspaceFiles, plays] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.skills(agent)),
                   Effect.promise(() => SystemPrompt.environment(model)),
@@ -1520,7 +1527,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     recallFacts({
                       projectId: Instance.project.id,
                       limit: factInjectLimit(),
-                      context: userText || undefined,
+                      context: recallCtx || undefined,
                     }),
                   ),
                   Effect.promise(() => recallWorkspaceContext({ sessionId: sessionID })),
@@ -1530,7 +1537,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   Effect.promise(() =>
                     recallPlays({
                       projectId: Instance.project.id,
-                      problem: userText,
+                      problem: recallCtx ?? "",
                       excludeSessionId: sessionID,
                       limit: 3,
                     }),
