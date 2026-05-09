@@ -6,6 +6,7 @@
  */
 
 import { generateText } from "ai"
+import { createHash } from "node:crypto"
 import path from "node:path"
 import { zengramDb, type Queryable } from "@/storage/db.zengram"
 import { ulid } from "ulid"
@@ -13,8 +14,20 @@ import { Log } from "@/util/log"
 import { Provider } from "@/provider/provider"
 import type { ProjectID } from "@/project/schema"
 import type { SessionID, MessageID } from "@/session/schema"
-import { EXTRACT_FACTS_SYSTEM_PROMPT, REFLECT_SYSTEM_PROMPT } from "./prompts"
+import { REFLECT_SYSTEM_PROMPT } from "./prompts"
 import { looksLikeReasoning } from "./noise"
+
+/**
+ * Normalize-and-hash fact content for dedup. Lowercases, collapses whitespace,
+ * strips simple punctuation that varies between paraphrases — so trivially
+ * different phrasings of the same fact collide. SHA-256 truncated to 16 hex
+ * chars (64 bits) is enough to be collision-safe at corpus scales we care
+ * about while staying compact in the similarity_hash TEXT column.
+ */
+export function factContentHash(content: string): string {
+  const norm = content.toLowerCase().replace(/[\s.,;:!?'"`]+/g, " ").trim()
+  return createHash("sha256").update(norm).digest("hex").slice(0, 16)
+}
 
 // Re-export so existing callers / tests can keep importing from
 // "@/knowledge/index" — the predicate lives in its own leaf module so probe
@@ -57,12 +70,29 @@ export type KnowledgeEntry = {
  */
 export function extractRecallContext(text: string | undefined): string | undefined {
   if (!text) return text
+  const inLen = text.length
   const sep = "\n---\n"
   const lastSep = text.lastIndexOf(sep)
+  let stripped = false
   if (lastSep > 0 && text.length - lastSep - sep.length >= 50) {
     text = text.slice(lastSep + sep.length).trim()
+    stripped = true
   }
-  if (text.length > 2000) text = text.slice(-2000)
+  let capped = false
+  if (text.length > 2000) {
+    text = text.slice(-2000)
+    capped = true
+  }
+  if (inLen > 1000) {
+    log.info("extractRecallContext", {
+      inLen,
+      sepIdx: lastSep,
+      stripped,
+      capped,
+      outLen: text.length,
+      head: text.slice(0, 60),
+    })
+  }
   return text
 }
 
@@ -121,12 +151,19 @@ export async function learnFact(input: {
   const db = zengramDb()
   const now = Date.now() * 1000
 
-  // Check for exact subject duplicate in this scope
+  // Two-stage dedup: (1) exact subject match (cheap, indexed); (2) normalized
+  // content hash (catches the case where two extraction passes produced the
+  // same fact under a slightly different subject phrasing — round 10 had 7 such
+  // dup-subject groups and presumably more cross-subject dup-content collisions
+  // that the subject-only check missed). Reuse the existing similarity_hash
+  // column rather than schema-migrating a new one.
+  const contentHash = factContentHash(input.content)
   const existing = await db.query<{ id: string; source_session: string | null }>(
     `SELECT id, source_session FROM knowledge
-     WHERE project_id = $1 AND scope = $2 AND subject = $3 AND status = 'active'
+     WHERE project_id = $1 AND scope = $2 AND status = 'active'
+       AND (subject = $3 OR similarity_hash = $4)
      LIMIT 1`,
-    [input.projectId, input.scope, input.subject],
+    [input.projectId, input.scope, input.subject, contentHash],
   )
   if (existing[0]) {
     // Cross-session confirmation only fires when both sessions are known and distinct.
@@ -161,10 +198,10 @@ export async function learnFact(input: {
   const id = "knw_" + ulid().toLowerCase()
   await db.execute(
     `INSERT INTO knowledge
-       (id, project_id, scope, subject, content, source_type, source_session, source_turn,
+       (id, project_id, scope, subject, content, similarity_hash, source_type, source_session, source_turn,
         status, importance, confidence, access_count, time_created, time_updated)
-     VALUES ($1,$2,$3,$4,$5,'agent',$6,$7,'active',0.7,0.8,0,$8,$9)`,
-    [id, input.projectId, input.scope, input.subject, input.content,
+     VALUES ($1,$2,$3,$4,$5,$6,'agent',$7,$8,'active',0.7,0.8,0,$9,$10)`,
+    [id, input.projectId, input.scope, input.subject, input.content, contentHash,
      input.sourceSession ?? null, input.sourceTurn ?? null, now, now],
   )
   // Compute and store embedding server-side via Zeta's embed() function.
@@ -410,7 +447,10 @@ export function extractFacts(text: string, maxFacts = 3): Array<{ subject: strin
     if (!NORMATIVE_RE.test(sentence) && !IMPERATIVE_START_RE.test(sentence)) continue
     // Strip leading list markers and bold
     const clean = sentence.replace(/^\d+\.\s+/, "").replace(/\*\*/g, "").trim()
-    const subject = clean.split(/[—\-,:;]/)[0].slice(0, 70).trim()
+    const head = clean.split(/[—\-,:;]/)[0]
+    // If slice cut mid-word, drop the trailing partial; if no cut, keep as-is.
+    const sliced = head.slice(0, 70)
+    const subject = (sliced.length < head.length ? sliced.replace(/\s+\S*$/, "") : sliced).trim()
     if (subject.length < 8) continue
     // Reject first-person/reasoning openers — see REASONING_NOISE_RE.
     if (looksLikeReasoning(subject)) continue
@@ -449,20 +489,16 @@ export async function extractAndLearn(input: {
 
   if (fullText.length < 100) return 0 // Too short to extract from
 
-  // Heuristic extraction runs on every turn.
-  const heuristicFacts = extractFacts(fullText)
-
-  // LLM extraction runs on high-value turns (>2 000 chars) — better quality,
-  // but costs a cheap model call. Fire-and-forget from caller's perspective;
-  // we await it here since extractAndLearn is already called fire-and-forget.
-  const llmFacts = fullText.length >= 2000 ? await extractFactsWithLlm(fullText) : []
-
-  const facts = mergeExtracted(heuristicFacts, llmFacts)
+  // Heuristic extraction only. The per-turn LLM extractor was cut after round 10:
+  // it generated noise (mid-thought "The fix should…" prose, narration, duplicates)
+  // that bench logs showed never crossed the 0.75 recall threshold, while
+  // reflection (throttled, runs over heuristic facts) is the path that produces
+  // the principle-level facts that actually get injected.
+  const facts = extractFacts(fullText)
   log.info("passive extraction", {
     turnId: input.turnId,
     textLen: fullText.length,
-    heuristic: heuristicFacts.length,
-    llm: llmFacts.length,
+    heuristic: facts.length,
     total: facts.length,
   })
 
@@ -489,55 +525,6 @@ export async function extractAndLearn(input: {
   }
 
   return stored
-}
-
-/**
- * Use a cheap LLM call to extract up to 5 durable facts from a turn.
- * Returns [] on any failure (model unavailable, parse error, etc.).
- */
-async function extractFactsWithLlm(text: string): Promise<Array<{ subject: string; content: string }>> {
-  try {
-    const modelRef = await Provider.defaultModel()
-    const smallModel = await Provider.getSmallModel(modelRef.providerID)
-    const fullModel = smallModel ?? (await Provider.getModel(modelRef.providerID, modelRef.modelID))
-    const language = await Provider.getLanguage(fullModel)
-
-    const { text: output } = await generateText({
-      model: language,
-      system: EXTRACT_FACTS_SYSTEM_PROMPT,
-      prompt: text.slice(0, 4000),
-    })
-
-    const cleaned = output.replace(/^```json\s*/m, "").replace(/```\s*$/m, "").trim()
-    const parsed = JSON.parse(cleaned)
-    if (!Array.isArray(parsed)) return []
-    const facts = parsed.filter(
-      (f): f is { subject: string; content: string } =>
-        typeof f?.subject === "string" && typeof f?.content === "string",
-    )
-    // Reject reasoning-style subjects/contents the model may have produced
-    // despite the prompt's REJECT examples. Belt-and-suspenders against the
-    // round2 noise pattern (subjects like "Now I understand the issue").
-    return facts.filter((f) => !looksLikeReasoning(f.subject) && !looksLikeReasoning(f.content))
-  } catch (e) {
-    log.warn("llm extraction failed", { err: e })
-    return []
-  }
-}
-
-/** Merge heuristic + LLM facts, deduping by subject. LLM facts take priority. */
-function mergeExtracted(
-  heuristic: Array<{ subject: string; content: string }>,
-  llm: Array<{ subject: string; content: string }>,
-): Array<{ subject: string; content: string }> {
-  const seen = new Set<string>()
-  const out: Array<{ subject: string; content: string }> = []
-  for (const f of [...llm, ...heuristic]) {
-    const key = f.subject.toLowerCase().slice(0, 40)
-    if (!seen.has(key)) { seen.add(key); out.push(f) }
-    if (out.length >= 8) break
-  }
-  return out
 }
 
 // Track when decay last ran per project to avoid running it on every turn.
@@ -865,16 +852,27 @@ export type PlayEntry = {
 const PLAY_SCOPE = "/play"
 const PLAY_SUBJECT_MAX = 120
 
-function playSubjectForSession(sessionId: string, problem: string): string {
-  // Use a session-scoped prefix so the same session can UPSERT its own row.
-  // The problem-statement excerpt is the semantic payload for embedding —
-  // run extractRecallContext first to strip any leading boilerplate so the
-  // PLAY_SUBJECT_MAX-byte budget actually holds problem-specific content
-  // instead of e.g. the bench preamble (round 9: 29/29 plays had subjects
-  // that were 100% preamble text, making play recall functionally dead).
+function playSubjectForSession(_sessionId: string, problem: string): string {
+  // The subject is the semantic payload for embedding (`embed(subject || '. ' || content)`).
+  // Strip:
+  //   1. Bench/agent preamble (extractRecallContext on the trailing `\n---\n`).
+  //   2. SWE-bench / GitHub-issue style header bleed: " Description (last modified by …)",
+  //      " Description \n", " Description: …", " Background:" — these are formulaic
+  //      boilerplate that don't help retrieval and crowd the title out of the
+  //      PLAY_SUBJECT_MAX budget. Self-match distance was 0.542 with the bleed
+  //      in place; collapsing to title-only should drive it toward ~0.
+  //   3. Mid-word truncation (drop trailing partial when slice cut inside a word).
+  // No `[sessionId]` prefix: uniqueness is enforced by the `knw_play_${sessionId}`
+  // primary key (see recordPlay), and formatPlaysBlock strips the prefix at
+  // read time anyway.
   const stripped = extractRecallContext(problem) ?? problem
-  const excerpt = stripped.replace(/\s+/g, " ").trim().slice(0, PLAY_SUBJECT_MAX)
-  return `[${sessionId}] ${excerpt}`
+  const oneLine = stripped.replace(/\s+/g, " ").trim()
+  // Trim at the SWE-bench-style boundary if it appears: " Description (last modified",
+  // " Description: ", " Description " followed by capital, or " Background:".
+  const boundary = oneLine.search(/ (?:Description(?: \(last modified| ?:|\s+(?=[A-Z]))|Background:)/)
+  const title = boundary > 0 ? oneLine.slice(0, boundary).trimEnd() : oneLine
+  const sliced = title.slice(0, PLAY_SUBJECT_MAX)
+  return (sliced.length < title.length ? sliced.replace(/\s+\S*$/, "") : sliced).trim()
 }
 
 interface EditChange {

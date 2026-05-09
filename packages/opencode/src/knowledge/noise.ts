@@ -14,7 +14,7 @@
 // just the assistant talking about its own thinking. Reject any subject /
 // content matching these patterns.
 export const REASONING_NOISE_RE =
-  /^(?:\*{0,2})(now\s+(?:i|let)|let\s+me|let's|i(?:'ll|'m| (?:see|can|need|will|understand|think|believe|notice|realize))|looking at|i see|perfect[!.]|great[!.]|the (?:problem|issue|bug|fix) (?:is|seems|appears|looks|here|now)|so |actually,|wait,|hmm,|first,|then,|next,|after that)/i
+  /^(?:\*{0,2})(now\s+(?:i|let)|let\s+me|let's|i(?:'ll|'m| (?:see|can|need|will|understand|think|believe|notice|realize))|looking at|i see|perfect[!.]|great[!.]|good[!.]|excellent[!.]|okay[!.]|the (?:problem|issue|bug|fix|solution|same)\b|this (?:pattern|allows|fix|solution|approach|works|creates)\b|found the\b|so |actually,|wait,|hmm,|first,|then,|next,|after that)/i
 
 /**
  * Test whether a string looks like first-person reasoning / narration rather
