@@ -7,6 +7,102 @@ elevation or rule something out.
 
 ---
 
+## Status snapshot — 2026-05-09 (corpus-quality push + Zeta scope-index bug discovered)
+
+Worked through corpus quality after the round-10 finding that 53% of /project facts were junk:
+
+**Code landed (`packages/opencode/src/knowledge/`):**
+1. `noise.ts` — extended `REASONING_NOISE_RE` to catch `the fix/solution/same`, `this pattern/allows/fix/approach`, `good[!.]`, `excellent[!.]`, `okay[!.]`, `found the\b`
+2. `index.ts` — `extractFacts` only trims trailing partial words when `slice(0, 70)` actually cut mid-word
+3. `index.ts` — `playSubjectForSession` no longer prepends `[sessionId]` (decorative; `formatPlaysBlock` already stripped at read time); also strips SWE-bench preamble bleed (` Description (last modified by …)`, ` Background:`)
+4. `index.ts` — **per-turn LLM fact extractor cut entirely** from `extractAndLearn` (kept heuristic + reflection only). The LLM extractor was generating noise that never crossed recall threshold while reflection was producing the principle-level facts that did inject. Dead helpers removed.
+5. `index.ts` — `factContentHash` + content-hash dedup in `learnFact` using existing `similarity_hash` column
+
+**Then discovered the Zeta scope-index non-determinism bug** (see `specs/zeta-scope-index-bug.md` and `memory/project_zeta_scope_index_bug.md`):
+- `WHERE scope='/play'` on round 10 DB returns 17/20/22/22/24 across fresh `db.open()` calls — random subset of true 32
+- `WHERE scope LIKE '/play'` (no wildcard) returns stable 32 — the true count
+- All bench-time recallPlays calls saw a random subset of plays per session — every prior measurement is confounded
+- **Root cause:** `BTreeMvccStore::apply_batch` ran `par_iter()` over a write list that contained Delete+Put pairs for the same idx_key (every UPDATE on a non-indexed column), and the SkipMap insert raced. Fix shipped as `~/zeta#979` (dedup per-pk before parallel apply); follow-up issue `~/zeta#981` covers the same dedup as a write-amp optimization in LSM mode (correctness-neutral).
+- Brief `scope LIKE` workaround in `learnFact` / `purgeReasoningNoise` / `recallPlays` — reverted once the fix shipped; only `recallFacts`'s LIKE-prefix calls remain (those are intentional `${scope}%` prefix matching).
+- **Post-fix probe** (5 fresh subprocess opens against round 10 DB): all 8 queries deterministic; `scope='/play'` = 32 (matches LIKE), `scope='/project'` = 43 (matches LIKE), 75 active = 39 reflection + 36 extracted, sums all consistent.
+
+**What this means for measurement:**
+- Round 10's "6/623 events injected" finding was on a random subset → not interpretable
+- All cross-round comparisons (rounds 7/8/9/10) are confounded
+- Treat absolute corpus counts in past rounds as ±25%
+- The next bench round, with deterministic reads, will be the first interpretable measurement
+
+**Open questions before re-launching a round:**
+- Will the cleaned corpus + per-turn-extractor cut + stable scope reads materially move res/Mtok?
+- Or do we need to also lower the 0.75 distance threshold / change extraction shape to mirror query phrasing?
+
+---
+
+## Status snapshot — 2026-05-08 (survey50_round10 — strip-preamble fix shipped; round-9 ZG edge revealed as artifact)
+
+Same env as round 9 (cap=30, gate=0.75, ZG_FACT_INJECT_LIMIT=5, preamble on, n=1×2 variants over 50 Django tasks). The only intentional change vs round 9 was the strip-preamble fix (commit `c5f5aee65`) — `extractRecallContext` strips the bench preamble before embedding, applied at both `recallFacts` and `recallPlays` call sites and inside `playSubjectForSession`.
+
+### Mid-run incidents
+
+1. **Wedge on dj-13297 baseline** (~28 min idle past last LLM call). Harness's own 30-min timer silently failed to fire — opencode subprocess reached 31:31 elapsed alive. Killed manually; harness moved on and recorded the partial 3-turn 13k-token result.
+2. **Watchdog added.** A 60s-poll watchdog was started after the manual kill: any opencode subprocess past 32 min etime gets SIGTERM (escalating to SIGKILL). It triggered exactly once at 17:15 on a 37-minute wedge — kept round 10 from stalling overnight. The harness's `runWithTimeout` (`agent.ts:45`) needs a deeper look later — its `setTimeout` plus negative-pid SIGKILL is correct on paper but doesn't always fire in practice.
+3. **Tailer captured 559 recall events** across ~7 distinct tasks — `service=knowledge inLen=… stripped=true` confirmed every captured task; top-1 distances varied per task (vs round-9's universal 0.689) and the previously-saturated 0.75 gate now meaningfully filters.
+
+### Headline numbers (50 tasks, 100 runs valid)
+
+| | baseline | zengram | ratio |
+|---|---|---|---|
+| Resolved | **6/50 (12.0%)** | **6/50 (12.0%)** | — |
+| Total tokens | 6.04M | 6.74M | 1.115× ZG |
+| **Resolved / 1M tok ★** | **0.99** | 0.89 | **0.90× ZG (worse)** |
+| Median tokens / resolved | 78.2k | 70.3k | 0.899× ZG cheaper |
+| Median turns / resolved | 7.5 | 9.5 | 1.27× ZG slower |
+| Resolved task overlap | dj-{11099, 13670, 14089, 14559, 15127, 15368} | identical | — |
+
+Both modes resolved the **same six tasks** — perfect overlap. ZG has no resolution-rate edge whatsoever this round.
+
+### What changed vs round 9
+
+| | round 9 | round 10 |
+|---|---|---|
+| BL resolved | 3/50 | **6/50 (+100%)** |
+| ZG resolved | 4/50 | 6/50 (+50%) |
+| BL tokens | 7.42M | 6.04M (-19%) |
+| ZG tokens | 5.99M | 6.74M (+13%) |
+| BL res/Mtok | 0.40 | **0.99 (+147%)** |
+| ZG res/Mtok | **0.67** | 0.89 (+33%) |
+
+**Baseline improved more than zengram.** The round-9 "ZG res/Mtok 1.67× BL" headline inverted: round-10 ZG res/Mtok is now 0.90× BL.
+
+### Root cause — methodological insight
+
+Tracing through the call graph: `initEmbedded()` in `src/index.ts:108` runs **unconditionally at startup, regardless of `OPENCODE_STORAGE`**. That means the "baseline" mode in this fork is *not* a no-Zengram baseline — it still calls `recallFacts` and `recallPlays` and queries the embedded Zeta knowledge table. The only difference between modes is session/message storage (sqlite vs Zengram), which is irrelevant to the prompt content the model sees.
+
+What separates the two modes in practice:
+- **baseline** uses a fresh `XDG_DATA_HOME` per task (`run-baseline.sh` allocates `/tmp/opencode-baseline-data-XXXXXX`) → the knowledge table starts empty every task → only intra-task facts (extracted during the current session) are recallable
+- **zengram** uses `OPENCODE_PINNED_DATA_DIR` (the suite-level multi-session dir) → the knowledge table accumulates facts across all 50 tasks of the round → multi-round persistence
+
+Under the broken (pre-strip) recall, both modes were effectively getting zero useful injections — baseline because its DB was empty, zengram because every query collapsed to the same wrong fact. Round-9's ZG advantage was an artifact of that symmetry under noise, not a real recall benefit.
+
+After the strip fix, **intra-task recall in baseline is now functional and clean**: facts extracted during the current task get genuinely-relevant matches against later turns of the same task. Meanwhile zengram is paying the cost of 9 prior rounds of accumulated junk facts (the 38% stream-of-consciousness fraction we identified in offline analysis), now actually surfacing because distances are meaningful.
+
+### Implications
+
+The mission goal is unchanged: zengram should beat baseline on res/Mtok. But the bar is much higher than round 9 suggested:
+
+- "Baseline" is really "Zengram with a fresh DB per task." Beating it requires the **multi-round persistence** to deliver positive value — i.e. cross-task facts that actually help a new task more than they hurt with noise.
+- Current corpus does not deliver that. The 38% junk fraction is noise that competes with the 5-fact-per-turn injection budget.
+- The strip fix is correct and stays. The next lever is **extraction-side cleanup**: stop the corpus from accumulating "But wait", "Actually", "Found it" stream-of-consciousness fragments in the first place; tighten the reflection prompt; consider a fact-quality gate at write time.
+
+### Concrete next steps
+
+- [ ] **Extraction filter at write time.** The reflection prompt currently lets through any fact the model proposes; add a syntactic + semantic filter that rejects (a) facts with no concrete subject anchor, (b) facts whose content is a meta-thought ("But wait, the test", "Actually I should") rather than a project assertion, (c) duplicates of recent facts.
+- [ ] **Investigate harness 30-min timeout failure.** `runWithTimeout` in `zengram-bench/harness/src/agent.ts` should fire SIGKILL on the negative pid at 30 min; the wedge on dj-13297 (and one more at 17:15 caught by the watchdog) shows it sometimes silently doesn't. The watchdog is a backstop, not a fix.
+- [ ] **Round 11 hypothesis to test:** rebuild the corpus from scratch under the strip-aware writer (no junk accumulation) and measure round 10's tasks again. If ZG res/Mtok climbs back above 1.0× BL on a clean corpus, extraction quality is confirmed as the lever; if it doesn't, the multi-round persistence story itself is shaky and we need a different framing.
+- [ ] **Stop pretending baseline is recall-free.** Either (a) gate `recallFacts/recallPlays` on `OPENCODE_STORAGE !== "sqlite"` so baseline really is no-recall and the comparison is clean, or (b) keep the current setup and explicitly rename the comparison "fresh-DB vs persistent-DB recall." Prefer (a) for clean methodology.
+
+---
+
 ## Status snapshot — 2026-05-07 (survey50_round9 — turn cap doubled to 30, zengram becomes absolutely cheaper)
 
 Skipped round 8 (would have been a same-config replicate of round 7) in favour of changing one lever: **`BENCH_MAX_TURNS=30`** (was 15). Hypothesis: under a tight turn cap baseline can't run far enough to express its inefficiency; under a looser cap, baseline burns to the wall while zengram (which terminates earlier when the fact tells it the answer) does not. Round 7 already showed median turns 15/15 — both hugging the cap — which makes 15 a measurement floor, not a real ceiling.
