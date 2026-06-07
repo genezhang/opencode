@@ -1,5 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  // Zengram cache-aware memory, loaded as an OpenCode plugin — the ONLY change
+  // this fork carries on top of upstream/dev (vs. the old intrinsic zengram-v2
+  // branch that edited 14 core files). The plugin lives out-of-tree in the
+  // zengram repo (sibling checkout); see its README for build/install:
+  //   ../../zengram/integrations/opencode/README.md
+  // The path is resolved relative to this .opencode/ directory; use an absolute
+  // path if your zengram checkout is not a sibling of this repo.
+  "plugin": ["../../zengram/integrations/opencode/zengram-memory.ts"],
   "provider": {},
   "permission": {},
   "reference": {
