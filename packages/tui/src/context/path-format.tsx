@@ -1,30 +1,15 @@
 import path from "path"
-import { createContext, useContext, type ParentProps } from "solid-js"
-import { abbreviateHome, useTuiEnvironment } from "../runtime"
-
-const context = createContext<{
-  path: () => string
-  format: (input?: string) => string
-}>()
-
-export function PathFormatterProvider(props: ParentProps<{ path: string | undefined }>) {
-  const environment = useTuiEnvironment()
-  return (
-    <context.Provider
-      value={{
-        path: () => props.path || environment.cwd,
-        format: (input) => formatPath(input, props.path || environment.cwd, environment.paths.home),
-      }}
-    >
-      {props.children}
-    </context.Provider>
-  )
-}
+import { abbreviateHome } from "../runtime"
+import { useLocation } from "./location"
+import { useTuiPaths } from "./runtime"
 
 export function usePathFormatter() {
-  const value = useContext(context)
-  if (!value) throw new Error("PathFormatter context must be used within a PathFormatterProvider")
-  return value
+  const paths = useTuiPaths()
+  const location = useLocation()
+  return {
+    path: () => location()?.directory || paths.cwd,
+    format: (input?: string) => formatPath(input, location()?.directory || paths.cwd, paths.home),
+  }
 }
 
 function formatPath(input: string | undefined, base: string, home: string) {
